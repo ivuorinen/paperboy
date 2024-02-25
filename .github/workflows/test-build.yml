@@ -1,7 +1,5 @@
-# This workflow will build a golang project
-# For more information see: https://docs.github.com/en/actions/automating-builds-and-tests/building-and-testing-go
-
-name: Test Build
+---
+name: Test Build and Run
 
 on:
   push:
@@ -11,7 +9,7 @@ on:
 
 jobs:
 
-  build:
+  test-build-and-run:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
@@ -23,3 +21,9 @@ jobs:
 
     - name: Build
       run: make build
+
+    - name: Setup default template and config
+      run: cp examples/ .
+
+    - name: Run program
+      run: ./paperboy
