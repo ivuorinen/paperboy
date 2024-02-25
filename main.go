@@ -24,7 +24,7 @@ import (
 	"time"
 
 	"github.com/mmcdole/gofeed"
-	"gopkg.in/yaml.v2"
+	"gopkg.in/yaml.v3"
 )
 
 // Version and Build information
