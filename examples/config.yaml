@@ -1,0 +1,9 @@
+feeds:
+  - https://xkcd.com/atom.xml
+  - https://www.foxtrot.com/feed/
+  - https://news.ycombinator.com/rss
+  - https://feeds.feedburner.com/codinghorror
+  - https://internetofshit.net/rss/
+  - https://techcrunch.com/feed/
+template: template.md
+output: output.md
