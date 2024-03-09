@@ -102,8 +102,12 @@ func main() {
 	sort.Strings(weeks)
 	slices.Reverse(weeks)
 
+	log.Printf("-> Sorted and reversed %d weeks", len(weeks))
+
 	// Generate Markdown output
 	output := generateMarkdown(config.Template, articlesByWeek, weeks)
+
+	log.Printf("-> Generated Markdown output")
 
 	// Write Markdown output to file
 	outputFile := config.Output
@@ -111,6 +115,9 @@ func main() {
 	if err != nil {
 		log.Fatalf("Error writing output file: %v", err)
 	}
+
+	log.Printf("-> Wrote output to %s", outputFile)
+	log.Printf("Paperboy finished")
 }
 
 // fetchArticles fetches articles from a given feed URL
