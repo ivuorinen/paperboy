@@ -6,8 +6,8 @@
 // Paperboy is a simple RSS feed reader that generates
 // a Markdown file with the latest articles from multiple feeds.
 
-//go:build go1.16
-// +build go1.16
+//go:build go1.22
+// +build go1.22
 
 package main
 
