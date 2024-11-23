@@ -7,7 +7,6 @@
 // a Markdown file with the latest articles from multiple feeds.
 
 //go:build go1.22
-// +build go1.22
 
 package main
 
