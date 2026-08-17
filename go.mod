@@ -1,6 +1,6 @@
 module github.com/ivuorinen/paperboy
 
-go 1.25.3
+go 1.26.6
 
 require (
 	github.com/mmcdole/gofeed v1.4.1
