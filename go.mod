@@ -3,7 +3,7 @@ module github.com/ivuorinen/paperboy
 go 1.26.6
 
 require (
-	github.com/mmcdole/gofeed v1.4.1
+	github.com/mmcdole/gofeed v1.4.2
 	gopkg.in/yaml.v3 v3.0.1
 )
 
