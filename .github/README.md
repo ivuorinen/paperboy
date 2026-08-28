@@ -4,7 +4,15 @@ CLI tool to generate a weekly grouped list of articles from defined RSS feeds.
 
 ## Usage
 
-Create `template.md` and `config.yaml` in the same directory as the binary.
+Create `template.md` and `config.yaml` in the directory you run `paperboy`
+from. Paths in `config.yaml` are resolved relative to that working directory,
+not to the binary's location.
+
+Pass `-config` to read the configuration from somewhere else:
+
+```console
+paperboy -config /etc/paperboy/config.yaml
+```
 
 There are examples of both of these files in the `examples` directory.
 
@@ -38,7 +46,16 @@ The contents are rendered between the two `---` lines.
 
 Then run the binary `paperboy` and the output will be written to the file specified in the `config.yaml` file.
 
+All three keys — `feeds`, `template` and `output` — are required, and an
+unrecognised key is an error rather than being ignored.
+
 ProTip: Use a cron job to run this weekly and send the output to your email.
+Cron runs with the working directory set to your home directory, so `cd` to the
+config's directory first (or use `-config` with absolute paths):
+
+```crontab
+0 8 * * 1 cd /srv/paperboy && /usr/local/bin/paperboy
+```
 
 ## License
 
