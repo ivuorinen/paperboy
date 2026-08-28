@@ -10,13 +10,25 @@ on:
 jobs:
   test-build-and-run:
     runs-on: ubuntu-latest
+    # Declared per job rather than once at workflow level: a job-level block is
+    # explicit about what that job may do, and a new job cannot silently
+    # inherit a scope nobody chose for it.
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Go
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: "1.26"
+          # Tracks the go and toolchain lines in go.mod so the two cannot drift.
+          go-version-file: go.mod
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test ./...
 
       - name: Build
         run: make build
@@ -24,5 +36,51 @@ jobs:
       - name: Setup default template and config
         run: cp examples/* .
 
+      # Smoke test only: this fetches live third-party feeds, so it is not a
+      # correctness signal. Feed errors are logged and skipped by design, which
+      # means this step can pass while every feed is unreachable. The go test
+      # step above is what actually gates the build.
       - name: Run program
         run: ./paperboy
+
+  # Separate job so security-events: write is scoped to the scan alone and the
+  # build job above keeps contents: read. Costs nothing extra: the govulncheck
+  # action bundles its own checkout and setup-go regardless.
+  vulncheck:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write # upload-sarif writes code-scanning alerts
+    steps:
+      - name: Scan for vulnerabilities
+        uses: golang/govulncheck-action@032d45514ae346b1db93c04b0c90b841c370344f # v1.1.0
+        with:
+          # The action defaults go-version-input to 'stable', and setup-go
+          # gives go-version precedence over go-version-file when both are
+          # set. Blanking it is what lets go.mod win, matching the build job.
+          go-version-input: ""
+          go-version-file: go.mod
+          output-format: sarif
+          output-file: govulncheck.sarif
+
+      - name: Upload results to code scanning
+        uses: github/codeql-action/upload-sarif@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4.37.9
+        with:
+          sarif_file: govulncheck.sarif
+          category: govulncheck
+
+      # govulncheck exits 0 in SARIF mode even when your code calls a
+      # vulnerable function, so the scan step reports but does not gate. Verified
+      # against golang.org/x/text@v0.3.0: text mode exits 3, SARIF mode exits 0.
+      # error-level results are exactly the reachable ones — warning means
+      # imported but not called, note means present in the module graph only.
+      - name: Fail on reachable vulnerabilities
+        run: |
+          count=$(jq '[.runs[].results[] | select(.level == "error")] | length' govulncheck.sarif)
+          echo "Reachable vulnerabilities: $count"
+          if [ "$count" -gt 0 ]; then
+            jq -r '.runs[].results[]
+              | select(.level == "error")
+              | "::error::\(.ruleId): \(.message.text | split("\n")[0])"' govulncheck.sarif
+            exit 1
+          fi

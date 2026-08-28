@@ -6,19 +6,20 @@
 // Paperboy is a simple RSS feed reader that generates
 // a Markdown file with the latest articles from multiple feeds.
 
-//go:build go1.22
-
 package main
 
 import (
-	"cmp"
+	"bytes"
+	"errors"
+	"flag"
 	"fmt"
+	"io"
 	"log"
+	"maps"
 	"net/url"
 	"os"
 	"regexp"
 	"slices"
-	"sort"
 	"strings"
 	"time"
 
@@ -26,11 +27,45 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// Version and Build information
-// These variables are set during build time
+// version and build are stamped by the linker; see the build target in the
+// Makefile. Both must stay constant-initialized or -X is silently ignored,
+// which is why build is not time.Now(): that reported the run date as the
+// build date on every invocation.
 var (
-	version string = "dev"
-	build   string = time.Now().Format("20060102")
+	version = "dev"
+	build   = "unknown"
+)
+
+// maxFeedBytes bounds how much of a remote feed response is read into memory.
+// gofeed defaults to no limit, so a hostile or misconfigured server could
+// otherwise exhaust memory; ParseURL's own 30s timeout does not bound a fast
+// server streaming a large body.
+const maxFeedBytes = 16 << 20
+
+// domainRe matches the trailing dotted-label sequence of a host. Compiled once
+// at package scope: MustCompile panics on a bad pattern, which belongs at
+// startup rather than part-way through a run.
+var domainRe = regexp.MustCompile(`([a-z0-9\-]+\.)+[a-z0-9\-]+`)
+
+// mdTextEscaper escapes the brackets that would close a Markdown link label
+// early, letting remote text break out of the label it is placed in.
+//
+// The backslash entry must stay first and must not be dropped: escaping only
+// the brackets is bypassable. A title ending in a backslash before a bracket
+// emits \\] — a literal backslash followed by an UNESCAPED ] — which closes
+// the label early and hands the following (...) to the reader as the link
+// destination. Verified with CommonMark: the title
+// `Free stuff\](https://evil.example/phish)` rendered an anchor pointing at
+// evil.example rather than at the article. strings.NewReplacer does not
+// rescan its own output, so escaping the escape character in the same
+// Replacer is correct and does not double-apply.
+var mdTextEscaper = strings.NewReplacer(`\`, `\\`, "[", `\[`, "]", `\]`)
+
+// mdURLEscaper percent-encodes the characters that would terminate a Markdown
+// link target early. net/url leaves parentheses unescaped in paths, since they
+// are legal sub-delims, so url.String alone is not sufficient here.
+var mdURLEscaper = strings.NewReplacer(
+	" ", "%20", "(", "%28", ")", "%29", "<", "%3C", ">", "%3E",
 )
 
 // Config represents the structure of the YAML configuration file
@@ -51,31 +86,33 @@ type Article struct {
 func main() {
 	log.Printf("Paperboy v.%s (build %s)", version, build)
 
-	// Read YAML configuration file
-	configFile := "config.yaml"
-	configData, err := os.ReadFile(configFile)
+	configFile := flag.String("config", "config.yaml", "path to the YAML configuration file")
+	flag.Parse()
+
+	config, err := loadConfig(*configFile)
 	if err != nil {
-		log.Fatalf("Error reading config.yaml file: %v", err)
+		log.Fatalf("Error loading config: %v", err)
 	}
 
-	// Parse YAML configuration
-	var config Config
-	err = yaml.Unmarshal(configData, &config)
+	// Read the template before any network work: a malformed template then
+	// costs a second rather than a full fetch cycle over every feed.
+	header, footer, err := loadTemplate(config.Template)
 	if err != nil {
-		log.Fatalf("Error parsing config.yaml file: %v", err)
+		log.Fatalf("Error loading template: %v", err)
 	}
 
 	log.Printf("Feeds: %d", len(config.Feeds))
 
-	// Fetch articles from each feed URL
+	fp := gofeed.NewParser()
+	fp.MaxByteSize = maxFeedBytes
+	fp.UserAgent = fmt.Sprintf("paperboy/%s (+https://github.com/ivuorinen/paperboy)", version)
+
 	articlesByWeek := make(map[string][]Article)
-	var weeks []string
 
 	for _, feedURL := range config.Feeds {
-
 		log.Printf("Fetching articles from %s", feedURL)
 
-		articles, err := fetchArticles(feedURL)
+		articles, err := fetchArticles(fp, feedURL)
 		if err != nil {
 			log.Printf("Error fetching articles from %s: %v", feedURL, err)
 			continue
@@ -90,99 +127,166 @@ func main() {
 			// e.g. 2021-01
 			id := fmt.Sprintf("%d-%02d", year, week)
 			articlesByWeek[id] = append(articlesByWeek[id], article)
-
-			if !slices.Contains(weeks, id) {
-				weeks = append(weeks, id)
-			}
 		}
 	}
 
-	// Sort weeks
-	sort.Strings(weeks)
+	// Newest week first. Derived from the map rather than tracked alongside it,
+	// so the two cannot disagree.
+	weeks := slices.Sorted(maps.Keys(articlesByWeek))
 	slices.Reverse(weeks)
 
 	log.Printf("-> Sorted and reversed %d weeks", len(weeks))
 
-	// Generate Markdown output
-	output := generateMarkdown(config.Template, articlesByWeek, weeks)
+	output := generateMarkdown(header, footer, articlesByWeek, weeks)
 
 	log.Printf("-> Generated Markdown output")
 
-	// Write Markdown output to file
-	outputFile := config.Output
-	err = os.WriteFile(outputFile, []byte(output), 0644)
-	if err != nil {
+	if err := os.WriteFile(config.Output, []byte(output), 0644); err != nil {
 		log.Fatalf("Error writing output file: %v", err)
 	}
 
-	log.Printf("-> Wrote output to %s", outputFile)
+	log.Printf("-> Wrote output to %s", config.Output)
 	log.Printf("Paperboy finished")
 }
 
-// fetchArticles fetches articles from a given feed URL
-func fetchArticles(feedURL string) ([]Article, error) {
-	fp := gofeed.NewParser()
-	feed, err := fp.ParseURL(feedURL)
+// loadConfig reads and validates the YAML configuration.
+//
+// Unknown keys are an error rather than a silent omission: a misspelled
+// "output" key would otherwise leave the field empty and fail only after every
+// feed had been fetched, with an error naming an empty path. An empty file is
+// allowed through the decoder and caught by the required-field checks below,
+// which say what is missing instead of reporting "EOF".
+func loadConfig(path string) (Config, error) {
+	var config Config
+
+	data, err := os.ReadFile(path)
 	if err != nil {
-		return nil, fmt.Errorf("error fetching feed: %v", err)
+		return config, fmt.Errorf("reading %s: %w", path, err)
 	}
 
+	dec := yaml.NewDecoder(bytes.NewReader(data))
+	dec.KnownFields(true)
+
+	if err := dec.Decode(&config); err != nil && !errors.Is(err, io.EOF) {
+		return config, fmt.Errorf("parsing %s: %w", path, err)
+	}
+
+	switch {
+	case len(config.Feeds) == 0:
+		return config, fmt.Errorf("%s: no feeds configured", path)
+	case config.Template == "":
+		return config, fmt.Errorf("%s: template is required", path)
+	case config.Output == "":
+		return config, fmt.Errorf("%s: output is required", path)
+	}
+
+	return config, nil
+}
+
+// loadTemplate reads the template and splits it into the header and footer
+// that surround the generated article list, separated by the two "---" lines
+// the README documents. Returns an error rather than terminating: it is called
+// before any feed is fetched precisely so the caller can fail cheaply.
+func loadTemplate(path string) (header, footer string, err error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", "", fmt.Errorf("reading template %s: %w", path, err)
+	}
+
+	parts := strings.SplitN(string(data), "---", 3)
+	if len(parts) != 3 {
+		return "", "", fmt.Errorf(
+			"template %s: want a header and footer separated by two --- lines, found %d section(s)",
+			path, len(parts),
+		)
+	}
+
+	return strings.TrimSpace(parts[0]), strings.TrimSpace(parts[2]), nil
+}
+
+// fetchArticles fetches articles from a given feed URL
+func fetchArticles(fp *gofeed.Parser, feedURL string) ([]Article, error) {
+	feed, err := fp.ParseURL(feedURL)
+	if err != nil {
+		// %w, not %v: callers cannot otherwise distinguish
+		// gofeed.ErrResponseTooLarge or a context deadline from an HTTP 404
+		// without matching on strings.
+		return nil, fmt.Errorf("parsing feed: %w", err)
+	}
+
+	return itemsToArticles(feed.Items), nil
+}
+
+// itemsToArticles converts feed items, dropping any it cannot date.
+//
+// PublishedParsed is nil whenever a feed omits a publication date — optional in
+// both RSS 2.0 and Atom — or supplies one gofeed cannot parse. Dereferencing it
+// panicked the whole run, and a panic escapes the per-feed error handling in
+// main, so a single dateless item discarded every feed already fetched.
+//
+// Split out of fetchArticles so the conversion is testable without network I/O.
+func itemsToArticles(items []*gofeed.Item) []Article {
 	var articles []Article
-	for _, item := range feed.Items {
-		// Parse publish date
-		publishAt := item.PublishedParsed.UTC()
-		articleDomain := getURLDomain(item.Link)
+
+	for _, item := range items {
+		published := item.PublishedParsed
+		if published == nil {
+			published = item.UpdatedParsed
+		}
+		if published == nil {
+			log.Printf("-> skipping %q: no parseable publish date", item.Title)
+			continue
+		}
 
 		articles = append(articles, Article{
 			Title:     item.Title,
 			URL:       item.Link,
-			PublishAt: publishAt,
-			URLDomain: articleDomain,
+			PublishAt: published.UTC(),
+			URLDomain: getURLDomain(item.Link),
 		})
 	}
 
-	return articles, nil
+	return articles
 }
 
-// generateMarkdown generates Markdown output with header and footer
-func generateMarkdown(templateFile string, articlesByWeek map[string][]Article, weeks []string) string {
-	// Read template file
-	templateData, err := os.ReadFile(templateFile)
-	if err != nil {
-		log.Fatalf("Error reading template file: %v", err)
-	}
-
-	// Split template into header and footer sections
-	templateParts := strings.SplitN(string(templateData), "---", 3)
-	if len(templateParts) != 3 {
-		log.Fatalf("Invalid template format")
-	}
-
-	header := strings.TrimSpace(templateParts[0])
-	footer := strings.TrimSpace(templateParts[2])
-
-	// Generate Markdown output
+// generateMarkdown renders the article list between the template's header and
+// footer.
+//
+// Titles and links originate in remote feeds and are escaped at this boundary:
+// an unescaped title containing newlines could otherwise end its list item and
+// forge week headings and links into the output document, which the README
+// suggests mailing out.
+func generateMarkdown(header, footer string, articlesByWeek map[string][]Article, weeks []string) string {
 	var output strings.Builder
+
 	output.WriteString(header)
 	output.WriteString("\n\n")
 
 	for _, week := range weeks {
 		articles := articlesByWeek[week]
-		if len(articles) == 0 {
-			continue
-		}
 
-		// Sort articles by publish date
+		// Newest first, matching the week ordering above.
 		slices.SortFunc(articles, func(a, b Article) int {
-			return cmp.Compare(a.PublishAt.Unix(), b.PublishAt.Unix())
+			return b.PublishAt.Compare(a.PublishAt)
 		})
 
-		output.WriteString(fmt.Sprintf("## Week: %s\n\n", week))
-		for _, article := range articles {
-			output.WriteString(fmt.Sprintf("- %s @ %s: [%s](%s)\n", article.PublishAt.Format("2006-01-02"), article.URLDomain, article.Title, article.URL))
-		}
-		output.WriteString("\n")
+		fmt.Fprintf(&output, "## Week: %s\n\n", week)
 
+		for _, article := range articles {
+			date := article.PublishAt.Format("2006-01-02")
+			title := mdText(article.Title)
+
+			// A link that is not a plain absolute http(s) URL is dropped
+			// rather than rendered, leaving the entry as plain text.
+			if link := mdURL(article.URL); link != "" {
+				fmt.Fprintf(&output, "- %s @ %s: [%s](%s)\n", date, article.URLDomain, title, link)
+				continue
+			}
+
+			fmt.Fprintf(&output, "- %s @ %s: %s\n", date, article.URLDomain, title)
+		}
+
+		output.WriteString("\n")
 	}
 
 	output.WriteString(footer)
@@ -191,19 +295,49 @@ func generateMarkdown(templateFile string, articlesByWeek map[string][]Article, 
 	return output.String()
 }
 
+// mdText makes remote text safe inside a Markdown link label: whitespace runs,
+// newlines included, collapse to single spaces so the text cannot end the list
+// item, and the bracket characters that would close the label are escaped.
+func mdText(s string) string {
+	return mdTextEscaper.Replace(strings.Join(strings.Fields(s), " "))
+}
+
+// mdURL returns raw as a Markdown-safe absolute http(s) URL, or "" when it is
+// neither. Restricting the scheme keeps a feed from emitting javascript: or
+// data: link targets.
+func mdURL(raw string) string {
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+		return ""
+	}
+
+	return mdURLEscaper.Replace(parsed.String())
+}
+
 // getURLDomain extracts the domain from a URL-like string
 // e.g. "https://example.com" -> "example.com"
+//
+// A parse failure falls through to the raw string rather than propagating:
+// url.Parse returns a nil *url.URL alongside its error, and dereferencing that
+// panicked on links carrying a malformed percent-escape. The scheme test is a
+// prefix check rather than the regexp `^https?`, which also matched "httpfoo"
+// and yielded an empty host for it.
+//
+// Case folding happens first because domainRe matches lowercase only while
+// url.Parse preserves host case. Without it "https://WWW.Example.com" misses
+// the www. trim and then matches from the first lowercase run, returning the
+// plausible but wrong "xample.com". Folding early also lets the scheme check
+// below catch "HTTPS://".
 func getURLDomain(urlString string) string {
-	urlString = strings.TrimSpace(urlString)
+	urlString = strings.ToLower(strings.TrimSpace(urlString))
 
-	if regexp.MustCompile(`^https?`).MatchString(urlString) {
-		read, _ := url.Parse(urlString)
-		urlString = read.Host
+	if strings.HasPrefix(urlString, "http://") || strings.HasPrefix(urlString, "https://") {
+		if parsed, err := url.Parse(urlString); err == nil {
+			urlString = parsed.Host
+		}
 	}
 
-	if regexp.MustCompile(`^www\.`).MatchString(urlString) {
-		urlString = regexp.MustCompile(`^www\.`).ReplaceAllString(urlString, "")
-	}
+	urlString = strings.TrimPrefix(urlString, "www.")
 
-	return regexp.MustCompile(`([a-z0-9\-]+\.)+[a-z0-9\-]+`).FindString(urlString)
+	return domainRe.FindString(urlString)
 }
