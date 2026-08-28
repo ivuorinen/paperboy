@@ -7,12 +7,14 @@ on:
   pull_request:
     branches: ["main"]
 
-permissions:
-  contents: read
-
 jobs:
   test-build-and-run:
     runs-on: ubuntu-latest
+    # Declared per job rather than once at workflow level: a job-level block is
+    # explicit about what that job may do, and a new job cannot silently
+    # inherit a scope nobody chose for it.
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 

@@ -15,6 +15,29 @@ import (
 	"github.com/mmcdole/gofeed"
 )
 
+// stringCase is one case for a func(string) string. Three of the helpers under
+// test have that shape, so they share one table type and one runner rather
+// than repeating the scaffolding each time.
+type stringCase struct {
+	name string
+	in   string
+	want string
+}
+
+// runStringCases runs cases against fn, naming fn in failures so a bare
+// subtest name still identifies what broke.
+func runStringCases(t *testing.T, fnName string, fn func(string) string, cases []stringCase) {
+	t.Helper()
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := fn(c.in); got != c.want {
+				t.Errorf("%s(%q) = %q, want %q", fnName, c.in, got, c.want)
+			}
+		})
+	}
+}
+
 // writeTemp writes content to a file in the test's temp dir and returns its
 // path, so template and config cases do not depend on the working directory.
 func writeTemp(t *testing.T, name, content string) string {
@@ -28,12 +51,66 @@ func writeTemp(t *testing.T, name, content string) string {
 	return path
 }
 
+// parseFeedItems parses a feed fixture through gofeed, so the item conversion
+// is exercised against the real parser without any network access.
+func parseFeedItems(t *testing.T, feedXML string) []*gofeed.Item {
+	t.Helper()
+
+	feed, err := gofeed.NewParser().Parse(strings.NewReader(feedXML))
+	if err != nil {
+		t.Fatalf("parsing fixture feed: %v", err)
+	}
+
+	return feed.Items
+}
+
+// mustTime parses an RFC3339 fixture timestamp or fails the test.
+func mustTime(t *testing.T, value string) time.Time {
+	t.Helper()
+
+	ts, err := time.Parse(time.RFC3339, value)
+	if err != nil {
+		t.Fatalf("bad fixture timestamp %q: %v", value, err)
+	}
+
+	return ts
+}
+
+// linesWithPrefix returns the lines of s starting with prefix. Markdown block
+// structure is line-anchored, so asserting on these is what distinguishes a
+// real heading from the same characters sitting inertly inside a link label.
+func linesWithPrefix(s, prefix string) []string {
+	var out []string
+
+	for _, line := range strings.Split(s, "\n") {
+		if strings.HasPrefix(line, prefix) {
+			out = append(out, line)
+		}
+	}
+
+	return out
+}
+
+// assertOrder fails unless every want appears in haystack, in the given order.
+func assertOrder(t *testing.T, haystack string, want ...string) {
+	t.Helper()
+
+	prev := -1
+
+	for _, w := range want {
+		i := strings.Index(haystack, w)
+		if i < 0 {
+			t.Fatalf("output missing %q\n---\n%s", w, haystack)
+		}
+		if i <= prev {
+			t.Fatalf("%q appears out of order\n---\n%s", w, haystack)
+		}
+		prev = i
+	}
+}
+
 func TestGetURLDomain(t *testing.T) {
-	tests := []struct {
-		name string
-		in   string
-		want string
-	}{
+	runStringCases(t, "getURLDomain", getURLDomain, []stringCase{
 		{"https URL", "https://example.com/a/b", "example.com"},
 		{"http URL", "http://example.com", "example.com"},
 		{"www stripped", "https://www.example.com/x", "example.com"},
@@ -48,35 +125,45 @@ func TestGetURLDomain(t *testing.T) {
 		{"http-prefixed non-URL", "httpfoo.example.com", "httpfoo.example.com"},
 		{"empty", "", ""},
 		{"no domain present", "not a url", ""},
-	}
+	})
+}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := getURLDomain(tt.in); got != tt.want {
-				t.Errorf("getURLDomain(%q) = %q, want %q", tt.in, got, tt.want)
-			}
-		})
-	}
+func TestMdText(t *testing.T) {
+	runStringCases(t, "mdText", mdText, []stringCase{
+		{"plain", "A normal title", "A normal title"},
+		{"newlines collapsed", "Line one\n\nLine two", "Line one Line two"},
+		{"tabs collapsed", "a\t\tb", "a b"},
+		{"brackets escaped", "Review [2026]", `Review \[2026\]`},
+		{"empty", "", ""},
+	})
+}
+
+func TestMdURL(t *testing.T) {
+	runStringCases(t, "mdURL", mdURL, []stringCase{
+		{"https passes", "https://example.com/a", "https://example.com/a"},
+		{"http passes", "http://example.com/a", "http://example.com/a"},
+		{"parens encoded", "https://example.com/a(b)", "https://example.com/a%28b%29"},
+		{"space encoded", "https://example.com/a b", "https://example.com/a%20b"},
+		{"javascript rejected", "javascript:alert(1)", ""},
+		{"data rejected", "data:text/html,<h1>x</h1>", ""},
+		{"relative rejected", "/relative/path", ""},
+		{"empty rejected", "", ""},
+	})
 }
 
 // TestItemsToArticlesSkipsUndatedItems is the regression test for the nil
 // PublishedParsed dereference. pubDate is optional in RSS 2.0, so this feed is
 // valid and previously panicked the whole run.
 func TestItemsToArticlesSkipsUndatedItems(t *testing.T) {
-	const feedXML = `<?xml version="1.0"?>
+	items := parseFeedItems(t, `<?xml version="1.0"?>
 <rss version="2.0"><channel>
 <title>t</title><link>https://example.com</link><description>d</description>
 <item><title>No date</title><link>https://example.com/a</link></item>
 <item><title>Dated</title><link>https://example.com/b</link>
 <pubDate>Mon, 02 Jan 2006 15:04:05 GMT</pubDate></item>
-</channel></rss>`
+</channel></rss>`)
 
-	feed, err := gofeed.NewParser().Parse(strings.NewReader(feedXML))
-	if err != nil {
-		t.Fatalf("parsing fixture feed: %v", err)
-	}
-
-	articles := itemsToArticles(feed.Items)
+	articles := itemsToArticles(items)
 
 	if len(articles) != 1 {
 		t.Fatalf("got %d articles, want 1 (the undated item must be dropped)", len(articles))
@@ -90,21 +177,16 @@ func TestItemsToArticlesSkipsUndatedItems(t *testing.T) {
 }
 
 // TestItemsToArticlesFallsBackToUpdated covers an Atom entry with only
-// <updated>, which is the common shape for feeds that never set <published>.
+// <updated>, the common shape for feeds that never set <published>.
 func TestItemsToArticlesFallsBackToUpdated(t *testing.T) {
-	const feedXML = `<?xml version="1.0"?>
+	items := parseFeedItems(t, `<?xml version="1.0"?>
 <feed xmlns="http://www.w3.org/2005/Atom">
 <title>t</title><id>urn:t</id><updated>2006-01-02T15:04:05Z</updated>
 <entry><title>Only updated</title><id>urn:e</id>
 <link href="https://example.com/a"/><updated>2006-01-02T15:04:05Z</updated></entry>
-</feed>`
+</feed>`)
 
-	feed, err := gofeed.NewParser().Parse(strings.NewReader(feedXML))
-	if err != nil {
-		t.Fatalf("parsing fixture feed: %v", err)
-	}
-
-	articles := itemsToArticles(feed.Items)
+	articles := itemsToArticles(items)
 
 	if len(articles) != 1 {
 		t.Fatalf("got %d articles, want 1", len(articles))
@@ -114,69 +196,22 @@ func TestItemsToArticlesFallsBackToUpdated(t *testing.T) {
 	}
 }
 
-func TestMdText(t *testing.T) {
-	tests := []struct {
-		name string
-		in   string
-		want string
-	}{
-		{"plain", "A normal title", "A normal title"},
-		{"newlines collapsed", "Line one\n\nLine two", "Line one Line two"},
-		{"tabs collapsed", "a\t\tb", "a b"},
-		{"brackets escaped", "Review [2026]", `Review \[2026\]`},
-		{"empty", "", ""},
-	}
+func TestLoadTemplateValid(t *testing.T) {
+	path := writeTemp(t, "template.md", "# Header\n\n---\n\n---\n\nFooter text\n")
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := mdText(tt.in); got != tt.want {
-				t.Errorf("mdText(%q) = %q, want %q", tt.in, got, tt.want)
-			}
-		})
+	header, footer, err := loadTemplate(path)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if header != "# Header" {
+		t.Errorf("header = %q, want %q", header, "# Header")
+	}
+	if footer != "Footer text" {
+		t.Errorf("footer = %q, want %q", footer, "Footer text")
 	}
 }
 
-func TestMdURL(t *testing.T) {
-	tests := []struct {
-		name string
-		in   string
-		want string
-	}{
-		{"https passes", "https://example.com/a", "https://example.com/a"},
-		{"http passes", "http://example.com/a", "http://example.com/a"},
-		{"parens encoded", "https://example.com/a(b)", "https://example.com/a%28b%29"},
-		{"space encoded", "https://example.com/a b", "https://example.com/a%20b"},
-		{"javascript rejected", "javascript:alert(1)", ""},
-		{"data rejected", "data:text/html,<h1>x</h1>", ""},
-		{"relative rejected", "/relative/path", ""},
-		{"empty rejected", "", ""},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := mdURL(tt.in); got != tt.want {
-				t.Errorf("mdURL(%q) = %q, want %q", tt.in, got, tt.want)
-			}
-		})
-	}
-}
-
-func TestLoadTemplate(t *testing.T) {
-	t.Run("valid", func(t *testing.T) {
-		path := writeTemp(t, "template.md", "# Header\n\n---\n\n---\n\nFooter text\n")
-
-		header, footer, err := loadTemplate(path)
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		if header != "# Header" {
-			t.Errorf("header = %q, want %q", header, "# Header")
-		}
-		if footer != "Footer text" {
-			t.Errorf("footer = %q, want %q", footer, "Footer text")
-		}
-	})
-
+func TestLoadTemplateRejectsBadInput(t *testing.T) {
 	t.Run("too few separators", func(t *testing.T) {
 		path := writeTemp(t, "template.md", "# Header\n\n---\n\nFooter\n")
 
@@ -192,158 +227,115 @@ func TestLoadTemplate(t *testing.T) {
 	})
 }
 
-func TestLoadConfig(t *testing.T) {
-	t.Run("valid", func(t *testing.T) {
-		path := writeTemp(t, "config.yaml",
-			"feeds:\n  - https://example.com/feed\ntemplate: template.md\noutput: output.md\n")
+func TestLoadConfigValid(t *testing.T) {
+	path := writeTemp(t, "config.yaml",
+		"feeds:\n  - https://example.com/feed\ntemplate: template.md\noutput: output.md\n")
 
-		config, err := loadConfig(path)
-		if err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-		if len(config.Feeds) != 1 || config.Template != "template.md" || config.Output != "output.md" {
-			t.Errorf("parsed config = %+v, want all three fields populated", config)
-		}
-	})
-
-	// Regression: a misspelled key previously unmarshalled cleanly and failed
-	// only after every feed had been fetched.
-	t.Run("unknown key rejected", func(t *testing.T) {
-		path := writeTemp(t, "config.yaml",
-			"feeds:\n  - https://example.com/feed\ntemplate: template.md\noutout: output.md\n")
-
-		if _, err := loadConfig(path); err == nil {
-			t.Fatal("want an error for the misspelled 'outout' key, got nil")
-		}
-	})
-
-	t.Run("missing required fields", func(t *testing.T) {
-		cases := map[string]string{
-			"no feeds":    "template: template.md\noutput: output.md\n",
-			"no template": "feeds:\n  - https://example.com/feed\noutput: output.md\n",
-			"no output":   "feeds:\n  - https://example.com/feed\ntemplate: template.md\n",
-			"empty file":  "",
-		}
-
-		for name, content := range cases {
-			t.Run(name, func(t *testing.T) {
-				if _, err := loadConfig(writeTemp(t, "config.yaml", content)); err == nil {
-					t.Fatalf("want an error for %s, got nil", name)
-				}
-			})
-		}
-	})
+	config, err := loadConfig(path)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(config.Feeds) != 1 || config.Template != "template.md" || config.Output != "output.md" {
+		t.Errorf("parsed config = %+v, want all three fields populated", config)
+	}
 }
 
-func TestGenerateMarkdown(t *testing.T) {
-	at := func(s string) time.Time {
-		ts, err := time.Parse(time.RFC3339, s)
-		if err != nil {
-			t.Fatalf("bad fixture timestamp %q: %v", s, err)
-		}
-		return ts
+func TestLoadConfigRejectsBadInput(t *testing.T) {
+	cases := map[string]string{
+		// Regression: a misspelled key previously unmarshalled cleanly and
+		// failed only after every feed had been fetched.
+		"unknown key": "feeds:\n  - https://e.com/f\ntemplate: template.md\noutout: output.md\n",
+		"no feeds":    "template: template.md\noutput: output.md\n",
+		"no template": "feeds:\n  - https://e.com/f\noutput: output.md\n",
+		"no output":   "feeds:\n  - https://e.com/f\ntemplate: template.md\n",
+		"empty file":  "",
 	}
 
-	t.Run("orders weeks and articles newest first", func(t *testing.T) {
-		byWeek := map[string][]Article{
-			"2026-01": {
-				{Title: "Older", URL: "https://a.example/1", URLDomain: "a.example", PublishAt: at("2026-01-01T00:00:00Z")},
-				{Title: "Newer", URL: "https://a.example/2", URLDomain: "a.example", PublishAt: at("2026-01-02T00:00:00Z")},
-			},
-			"2026-02": {
-				{Title: "Next week", URL: "https://b.example/1", URLDomain: "b.example", PublishAt: at("2026-01-08T00:00:00Z")},
-			},
-		}
-		weeks := []string{"2026-02", "2026-01"}
-
-		got := generateMarkdown("HEAD", "FOOT", byWeek, weeks)
-
-		wantOrder := []string{"HEAD", "## Week: 2026-02", "Next week", "## Week: 2026-01", "Newer", "Older", "FOOT"}
-		prev := -1
-		for _, want := range wantOrder {
-			i := strings.Index(got, want)
-			if i < 0 {
-				t.Fatalf("output missing %q\n---\n%s", want, got)
+	for name, content := range cases {
+		t.Run(name, func(t *testing.T) {
+			if _, err := loadConfig(writeTemp(t, "config.yaml", content)); err == nil {
+				t.Fatalf("want an error for %s, got nil", name)
 			}
-			if i <= prev {
-				t.Fatalf("%q appears out of order\n---\n%s", want, got)
-			}
-			prev = i
-		}
-	})
+		})
+	}
+}
 
-	// Regression: an unescaped title could end its list item and forge a week
-	// heading and an arbitrary link into the document.
-	t.Run("neutralizes an injecting title", func(t *testing.T) {
-		byWeek := map[string][]Article{
-			"2026-01": {{
-				Title:     "Benign\n\n## Week: 2099-99\n\n- [Click me](https://evil.example/phish)",
-				URL:       "https://a.example/1",
-				URLDomain: "a.example",
-				PublishAt: at("2026-01-01T00:00:00Z"),
-			}},
-		}
+func TestGenerateMarkdownOrdersNewestFirst(t *testing.T) {
+	byWeek := map[string][]Article{
+		"2026-01": {
+			{Title: "Older", URL: "https://a.example/1", URLDomain: "a.example", PublishAt: mustTime(t, "2026-01-01T00:00:00Z")},
+			{Title: "Newer", URL: "https://a.example/2", URLDomain: "a.example", PublishAt: mustTime(t, "2026-01-02T00:00:00Z")},
+		},
+		"2026-02": {
+			{Title: "Next week", URL: "https://b.example/1", URLDomain: "b.example", PublishAt: mustTime(t, "2026-01-08T00:00:00Z")},
+		},
+	}
 
-		got := generateMarkdown("HEAD", "FOOT", byWeek, []string{"2026-01"})
+	got := generateMarkdown("HEAD", "FOOT", byWeek, []string{"2026-02", "2026-01"})
 
-		// The injected text is expected to survive as inert link-label text;
-		// escaping neutralizes structure, it does not censor the title. So
-		// these assertions check structure, not substrings.
-		var headings, items int
-		for _, line := range strings.Split(got, "\n") {
-			// An ATX heading needs its # at the start of a line, which is why
-			// mdText collapsing newlines is what defuses the injection.
-			if strings.HasPrefix(line, "#") {
-				headings++
-			}
-			if strings.HasPrefix(line, "- ") {
-				items++
-				// The link destination is whatever follows the final
-				// unescaped "](" — it must be the real URL, not the one the
-				// title tried to smuggle in.
-				if !strings.HasSuffix(line, "](https://a.example/1)") {
-					t.Errorf("list item does not end in the legitimate link target: %q", line)
-				}
-				if strings.Contains(line, "]("+"https://evil.example/phish)") &&
-					!strings.Contains(line, `\](https://evil.example/phish)`) {
-					t.Errorf("injected target sits behind an unescaped bracket: %q", line)
-				}
-			}
-		}
+	assertOrder(t, got, "HEAD", "## Week: 2026-02", "Next week", "## Week: 2026-01", "Newer", "Older", "FOOT")
+}
 
-		if headings != 1 {
-			t.Errorf("got %d heading lines, want 1 (the real week heading)\n---\n%s", headings, got)
-		}
-		if items != 1 {
-			t.Errorf("got %d list-item lines, want 1\n---\n%s", items, got)
-		}
-	})
+// TestGenerateMarkdownNeutralizesInjectingTitle is the regression test for the
+// Markdown injection. The injected text is expected to survive as inert
+// link-label text: escaping neutralizes structure, it does not censor the
+// title. So this asserts on structure, not on substrings.
+func TestGenerateMarkdownNeutralizesInjectingTitle(t *testing.T) {
+	byWeek := map[string][]Article{
+		"2026-01": {{
+			Title:     "Benign\n\n## Week: 2099-99\n\n- [Click me](https://evil.example/phish)",
+			URL:       "https://a.example/1",
+			URLDomain: "a.example",
+			PublishAt: mustTime(t, "2026-01-01T00:00:00Z"),
+		}},
+	}
 
-	t.Run("renders a rejected link as plain text", func(t *testing.T) {
-		byWeek := map[string][]Article{
-			"2026-01": {{
-				Title:     "Sketchy",
-				URL:       "javascript:alert(1)",
-				URLDomain: "",
-				PublishAt: at("2026-01-01T00:00:00Z"),
-			}},
-		}
+	got := generateMarkdown("HEAD", "FOOT", byWeek, []string{"2026-01"})
 
-		got := generateMarkdown("HEAD", "FOOT", byWeek, []string{"2026-01"})
+	// An ATX heading needs its # at the start of a line, which is why
+	// collapsing the newlines in the title is what defuses the injection.
+	if headings := linesWithPrefix(got, "#"); len(headings) != 1 {
+		t.Errorf("got %d heading lines, want 1 (the real week heading)\n---\n%s", len(headings), got)
+	}
 
-		if strings.Contains(got, "javascript:") {
-			t.Errorf("javascript: target reached the output\n---\n%s", got)
-		}
-		if !strings.Contains(got, "Sketchy") {
-			t.Errorf("title dropped along with the link\n---\n%s", got)
-		}
-	})
+	items := linesWithPrefix(got, "- ")
+	if len(items) != 1 {
+		t.Fatalf("got %d list-item lines, want 1\n---\n%s", len(items), got)
+	}
 
-	t.Run("no articles", func(t *testing.T) {
-		got := generateMarkdown("HEAD", "FOOT", map[string][]Article{}, nil)
+	// The link destination is whatever follows the final unescaped "](" — it
+	// must be the real URL, not the one the title tried to smuggle in.
+	if !strings.HasSuffix(items[0], "](https://a.example/1)") {
+		t.Errorf("item does not end in the legitimate link target: %q", items[0])
+	}
+	if !strings.Contains(items[0], `\](https://evil.example/phish)`) {
+		t.Errorf("injected target is not sitting behind an escaped bracket: %q", items[0])
+	}
+}
 
-		if got != "HEAD\n\nFOOT\n" {
-			t.Errorf("got %q, want %q", got, "HEAD\n\nFOOT\n")
-		}
-	})
+func TestGenerateMarkdownRejectsUnsafeLink(t *testing.T) {
+	byWeek := map[string][]Article{
+		"2026-01": {{
+			Title:     "Sketchy",
+			URL:       "javascript:alert(1)",
+			PublishAt: mustTime(t, "2026-01-01T00:00:00Z"),
+		}},
+	}
+
+	got := generateMarkdown("HEAD", "FOOT", byWeek, []string{"2026-01"})
+
+	if strings.Contains(got, "javascript:") {
+		t.Errorf("javascript: target reached the output\n---\n%s", got)
+	}
+	if !strings.Contains(got, "Sketchy") {
+		t.Errorf("title dropped along with the link\n---\n%s", got)
+	}
+}
+
+func TestGenerateMarkdownNoArticles(t *testing.T) {
+	got := generateMarkdown("HEAD", "FOOT", map[string][]Article{}, nil)
+
+	if got != "HEAD\n\nFOOT\n" {
+		t.Errorf("got %q, want %q", got, "HEAD\n\nFOOT\n")
+	}
 }
