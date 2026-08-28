@@ -118,6 +118,13 @@ func TestGetURLDomain(t *testing.T) {
 		{"bare domain", "example.com", "example.com"},
 		{"subdomain kept", "https://news.sub.example.com/x", "news.sub.example.com"},
 		{"surrounding space", "  https://example.com  ", "example.com"},
+		// Hostnames are case-insensitive; domainRe is not. Before folding,
+		// the uppercase-host cases returned "" and the uppercase-www case
+		// returned the plausible but wrong "xample.com".
+		{"uppercase host", "https://EXAMPLE.com/a", "example.com"},
+		{"mixed-case host", "https://Example.COM/a", "example.com"},
+		{"uppercase scheme", "HTTPS://EXAMPLE.COM/Some/Path", "example.com"},
+		{"uppercase www", "https://WWW.Example.com/a", "example.com"},
 		// Regression: url.Parse returns (nil, err) here, and the old code
 		// dereferenced the nil *url.URL.
 		{"malformed percent escape", "https://example.com/%zz", "example.com"},
@@ -134,8 +141,67 @@ func TestMdText(t *testing.T) {
 		{"newlines collapsed", "Line one\n\nLine two", "Line one Line two"},
 		{"tabs collapsed", "a\t\tb", "a b"},
 		{"brackets escaped", "Review [2026]", `Review \[2026\]`},
+		// Escaping only the brackets is bypassable: a trailing backslash
+		// turns the escaper's own \] into \\] — a literal backslash plus an
+		// unescaped ] — closing the link label early and letting the title
+		// supply its own destination.
+		{"backslash escaped", `Title\`, `Title\\`},
+		{"retarget payload", `x\](https://evil.example)`, `x\\\](https://evil.example)`},
 		{"empty", "", ""},
 	})
+}
+
+// TestGenerateMarkdownRejectsLabelBreakout covers the escape bypass end to end:
+// the rendered item must still carry the article's own URL as its destination.
+func TestGenerateMarkdownRejectsLabelBreakout(t *testing.T) {
+	byWeek := map[string][]Article{
+		"2026-01": {{
+			Title:     `Free stuff\](https://evil.example/phish)`,
+			URL:       "https://real.example/post",
+			URLDomain: "real.example",
+			PublishAt: mustTime(t, "2026-01-01T00:00:00Z"),
+		}},
+	}
+
+	got := generateMarkdown("HEAD", "FOOT", byWeek, []string{"2026-01"})
+
+	items := linesWithPrefix(got, "- ")
+	if len(items) != 1 {
+		t.Fatalf("got %d list-item lines, want 1\n---\n%s", len(items), got)
+	}
+	if !strings.HasSuffix(items[0], "](https://real.example/post)") {
+		t.Errorf("link destination was retargeted by the title: %q", items[0])
+	}
+
+	// The precise property: the label must close at the destination we wrote,
+	// not at any bracket the title supplied. A substring check cannot express
+	// this — the correct output "\\\]" legitimately contains "\\]".
+	if got, want := firstUnescapedBracket(items[0]), strings.LastIndex(items[0], "]("); got != want {
+		t.Errorf("label closes at byte %d, want %d (the title closed it early): %q", got, want, items[0])
+	}
+}
+
+// firstUnescapedBracket returns the index of the first "]" that is not itself
+// escaped, counting the run of backslashes before it: an even run leaves the
+// bracket live, an odd run escapes it. Returns -1 when every bracket is
+// escaped.
+func firstUnescapedBracket(s string) int {
+	for i := range len(s) {
+		if s[i] != ']' {
+			continue
+		}
+
+		backslashes := 0
+		for j := i - 1; j >= 0 && s[j] == '\\'; j-- {
+			backslashes++
+		}
+
+		if backslashes%2 == 0 {
+			return i
+		}
+	}
+
+	return -1
 }
 
 func TestMdURL(t *testing.T) {

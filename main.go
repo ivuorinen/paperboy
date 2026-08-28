@@ -49,7 +49,17 @@ var domainRe = regexp.MustCompile(`([a-z0-9\-]+\.)+[a-z0-9\-]+`)
 
 // mdTextEscaper escapes the brackets that would close a Markdown link label
 // early, letting remote text break out of the label it is placed in.
-var mdTextEscaper = strings.NewReplacer("[", `\[`, "]", `\]`)
+//
+// The backslash entry must stay first and must not be dropped: escaping only
+// the brackets is bypassable. A title ending in a backslash before a bracket
+// emits \\] — a literal backslash followed by an UNESCAPED ] — which closes
+// the label early and hands the following (...) to the reader as the link
+// destination. Verified with CommonMark: the title
+// `Free stuff\](https://evil.example/phish)` rendered an anchor pointing at
+// evil.example rather than at the article. strings.NewReplacer does not
+// rescan its own output, so escaping the escape character in the same
+// Replacer is correct and does not double-apply.
+var mdTextEscaper = strings.NewReplacer(`\`, `\\`, "[", `\[`, "]", `\]`)
 
 // mdURLEscaper percent-encodes the characters that would terminate a Markdown
 // link target early. net/url leaves parentheses unescaped in paths, since they
@@ -312,8 +322,14 @@ func mdURL(raw string) string {
 // panicked on links carrying a malformed percent-escape. The scheme test is a
 // prefix check rather than the regexp `^https?`, which also matched "httpfoo"
 // and yielded an empty host for it.
+//
+// Case folding happens first because domainRe matches lowercase only while
+// url.Parse preserves host case. Without it "https://WWW.Example.com" misses
+// the www. trim and then matches from the first lowercase run, returning the
+// plausible but wrong "xample.com". Folding early also lets the scheme check
+// below catch "HTTPS://".
 func getURLDomain(urlString string) string {
-	urlString = strings.TrimSpace(urlString)
+	urlString = strings.ToLower(strings.TrimSpace(urlString))
 
 	if strings.HasPrefix(urlString, "http://") || strings.HasPrefix(urlString, "https://") {
 		if parsed, err := url.Parse(urlString); err == nil {
