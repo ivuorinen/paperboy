@@ -1,6 +1,6 @@
 module github.com/ivuorinen/paperboy
 
-go 1.25.0
+go 1.26.0
 
 toolchain go1.27.2
 
@@ -11,6 +11,6 @@ require (
 
 require (
 	github.com/mmcdole/goxpp/v2 v2.0.0 // indirect
-	golang.org/x/net v0.58.0 // indirect
-	golang.org/x/text v0.41.0 // indirect
+	golang.org/x/net v0.60.0 // indirect
+	golang.org/x/text v0.42.0 // indirect
 )
