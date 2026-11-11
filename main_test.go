@@ -575,6 +575,115 @@ func TestRunAllFeedsFailedKeepsOutput(t *testing.T) {
 	}
 }
 
+// rssFeed wraps items in a minimal RSS 2.0 document.
+func rssFeed(items ...string) string {
+	return `<?xml version="1.0"?><rss version="2.0"><channel><title>t</title>` +
+		`<link>https://example.com</link><description>d</description>` +
+		strings.Join(items, "") + `</channel></rss>`
+}
+
+// rssItem renders one dated item linking to https://example.com/<slug>.
+func rssItem(title, slug, pubDate string) string {
+	return fmt.Sprintf("<item><title>%s</title><link>https://example.com/%s</link><pubDate>%s</pubDate></item>",
+		title, slug, pubDate)
+}
+
+// feedServer serves each path in feeds as an RSS body and answers every other
+// path with HTTP 500, standing in for an unreachable feed.
+func feedServer(t *testing.T, feeds map[string]string) *httptest.Server {
+	t.Helper()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, ok := feeds[r.URL.Path]
+		if !ok {
+			http.Error(w, "down", http.StatusInternalServerError)
+			return
+		}
+		_, _ = w.Write([]byte(body))
+	}))
+	t.Cleanup(srv.Close)
+
+	return srv
+}
+
+// runToString runs one cycle over feeds and returns the written output.
+func runToString(t *testing.T, feeds ...string) string {
+	t.Helper()
+
+	output := writeTemp(t, "output.md", "previous digest\n")
+	if err := run(writeRunConfig(t, output, feeds...)); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	got, err := os.ReadFile(output)
+	if err != nil {
+		t.Fatalf("reading output: %v", err)
+	}
+
+	return string(got)
+}
+
+// TestRunGroupsByISOWeek drives the whole pipeline with one healthy and one
+// failing feed. Weeks are ISO weeks: 2024-12-30 belongs to 2025-01 and
+// 2027-01-01 to 2026-53 (checked with `date +%G-%V`), which a calendar-year
+// grouping would get wrong at both ends of the year.
+func TestRunGroupsByISOWeek(t *testing.T) {
+	srv := feedServer(t, map[string]string{
+		"/ok": rssFeed(
+			rssItem("Boundary", "1", "Mon, 30 Dec 2024 12:00:00 GMT"),
+			rssItem("Year end", "2", "Fri, 01 Jan 2027 12:00:00 GMT"),
+		),
+	})
+
+	got := runToString(t, srv.URL+"/ok", srv.URL+"/down")
+
+	assertOrder(t, got, "# Head", "## Week: 2026-53", "Year end", "## Week: 2025-01", "Boundary", "Foot")
+	if strings.Contains(got, "previous digest") {
+		t.Errorf("a partial failure must still replace the old digest\n---\n%s", got)
+	}
+}
+
+// TestRunSendsUserAgent checks the identifying User-Agent reaches the feed
+// server; gofeed's default is "Gofeed/1.0", which some hosts block.
+func TestRunSendsUserAgent(t *testing.T) {
+	var agent string
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		agent = r.Header.Get("User-Agent")
+		_, _ = w.Write([]byte(rssFeed(rssItem("Post", "1", "Tue, 06 Jan 2026 12:00:00 GMT"))))
+	}))
+	t.Cleanup(srv.Close)
+
+	runToString(t, srv.URL)
+
+	if !strings.HasPrefix(agent, "paperboy/") {
+		t.Errorf("User-Agent = %q, want it to start with %q", agent, "paperboy/")
+	}
+}
+
+// TestRunCapsFeedSize serves a valid feed one byte over maxFeedBytes next to a
+// small one. Without the cap gofeed reads the whole body and the oversized
+// feed's article reaches the digest.
+func TestRunCapsFeedSize(t *testing.T) {
+	huge := rssFeed(
+		"<item><title>Huge</title><link>https://example.com/h</link><pubDate>Tue, 06 Jan 2026 12:00:00 GMT</pubDate>" +
+			"<description>" + strings.Repeat("a", maxFeedBytes+1) + "</description></item>",
+	)
+	srv := feedServer(t, map[string]string{
+		"/huge":  huge,
+		"/small": rssFeed(rssItem("Small", "s", "Tue, 06 Jan 2026 12:00:00 GMT")),
+	})
+
+	got := runToString(t, srv.URL+"/huge", srv.URL+"/small")
+
+	if !strings.Contains(got, "Small") {
+		t.Errorf("the small feed's article is missing\n---\n%s", got)
+	}
+	if strings.Contains(got, "Huge") {
+		t.Error("the oversized feed was read past maxFeedBytes and rendered")
+	}
+}
+
 // TestWriteFileAtomicReplacesWholeFile pins the rename-over semantics. A reader
 // holding the old file keeps the old bytes only if the path was swapped to a
 // new file; os.WriteFile truncates the same inode in place, which is what let a
