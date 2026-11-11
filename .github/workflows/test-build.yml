@@ -16,6 +16,9 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    env:
+      # renovate: datasource=github-releases depName=golangci/golangci-lint
+      GOLANGCI_LINT_VERSION: v2.15.0
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -31,6 +34,21 @@ jobs:
 
       - name: Vet
         run: go vet ./...
+
+      - name: Check formatting
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt -l lists unformatted files:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      # The same linter `make lint` runs, so CI and a local run cannot disagree.
+      - name: Lint
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          version: ${{ env.GOLANGCI_LINT_VERSION }}
 
       - name: Test
         run: go test ./...
