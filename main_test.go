@@ -360,11 +360,26 @@ func TestLoadConfigValid(t *testing.T) {
 	}
 }
 
+// TestLoadConfigRejectsUnknownKey is the regression test for silently ignored
+// keys: a misspelled key used to unmarshal cleanly and fail only after every
+// feed had been fetched. The fixture is otherwise complete, so only the
+// unknown-key check can reject it; a fixture missing a required field passes
+// even with that check deleted.
+func TestLoadConfigRejectsUnknownKey(t *testing.T) {
+	path := writeTemp(t, "config.yaml",
+		"feeds:\n  - https://e.com/f\ntemplate: template.md\noutput: output.md\nextra: x\n")
+
+	_, err := loadConfig(path)
+	if err == nil {
+		t.Fatal("want an error for the unknown key, got nil")
+	}
+	if !strings.Contains(err.Error(), "extra") {
+		t.Errorf("error %q does not name the unknown key \"extra\"", err)
+	}
+}
+
 func TestLoadConfigRejectsBadInput(t *testing.T) {
 	cases := map[string]string{
-		// Regression: a misspelled key previously unmarshalled cleanly and
-		// failed only after every feed had been fetched.
-		"unknown key": "feeds:\n  - https://e.com/f\ntemplate: template.md\noutout: output.md\n",
 		"no feeds":    "template: template.md\noutput: output.md\n",
 		"no template": "feeds:\n  - https://e.com/f\noutput: output.md\n",
 		"no output":   "feeds:\n  - https://e.com/f\ntemplate: template.md\n",
