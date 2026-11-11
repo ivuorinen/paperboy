@@ -37,9 +37,9 @@ jobs:
         run: cp examples/* .
 
       # Smoke test only: this fetches live third-party feeds, so it is not a
-      # correctness signal. Feed errors are logged and skipped by design, which
-      # means this step can pass while every feed is unreachable. The go test
-      # step above is what actually gates the build.
+      # correctness signal. A failing feed is logged and skipped by design; the
+      # step fails only when every feed is unreachable, which paperboy reports
+      # with a non-zero exit. The go test step above is what gates the build.
       - name: Run program
         run: ./paperboy
 

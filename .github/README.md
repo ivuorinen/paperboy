@@ -57,6 +57,10 @@ config's directory first (or use `-config` with absolute paths):
 0 8 * * 1 cd /srv/paperboy && /usr/local/bin/paperboy
 ```
 
+A feed that fails to load is logged and skipped. If every feed fails, `paperboy`
+exits non-zero and leaves the previous output file untouched, so chain the mail
+step with `&&` to skip it on an outage.
+
 ## License
 
 The MIT License (MIT) - see [LICENSE](../LICENSE.md) for more details

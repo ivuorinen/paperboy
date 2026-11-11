@@ -106,16 +106,25 @@ func main() {
 	configFile := flag.String("config", "config.yaml", "path to the YAML configuration file")
 	flag.Parse()
 
-	config, err := loadConfig(*configFile)
+	if err := run(*configFile); err != nil {
+		log.Fatalf("Error %v", err)
+	}
+}
+
+// run performs one fetch-and-write cycle for the configuration at configFile.
+// It is main without the process exit, so the whole pipeline — config,
+// template, fetching, week grouping and the output write — runs under test.
+func run(configFile string) error {
+	config, err := loadConfig(configFile)
 	if err != nil {
-		log.Fatalf("Error loading config: %v", err)
+		return fmt.Errorf("loading config: %w", err)
 	}
 
 	// Read the template before any network work: a malformed template then
 	// costs a second rather than a full fetch cycle over every feed.
 	header, footer, err := loadTemplate(config.Template)
 	if err != nil {
-		log.Fatalf("Error loading template: %v", err)
+		return fmt.Errorf("loading template: %w", err)
 	}
 
 	log.Printf("Feeds: %d", len(config.Feeds))
@@ -125,6 +134,7 @@ func main() {
 	fp.UserAgent = fmt.Sprintf("paperboy/%s (+https://github.com/ivuorinen/paperboy)", version)
 
 	articlesByWeek := make(map[string][]Article)
+	fetched := 0
 
 	for _, feedURL := range config.Feeds {
 		log.Printf("Fetching articles from %s", feedURL)
@@ -135,6 +145,7 @@ func main() {
 			continue
 		}
 
+		fetched++
 		log.Printf("-> Got %d articles", len(articles))
 
 		// Group articles by publish week
@@ -145,6 +156,13 @@ func main() {
 			id := fmt.Sprintf("%d-%02d", year, week)
 			articlesByWeek[id] = append(articlesByWeek[id], article)
 		}
+	}
+
+	// A single failing feed is logged and skipped, but losing every feed is an
+	// outage (network, DNS, proxy), not news: writing would replace the last
+	// good digest with an empty one and report success to cron.
+	if fetched == 0 {
+		return fmt.Errorf("fetching feeds: all %d failed; %s left untouched", len(config.Feeds), config.Output)
 	}
 
 	// Newest week first. Derived from the map rather than tracked alongside it,
@@ -159,11 +177,13 @@ func main() {
 	log.Printf("-> Generated Markdown output")
 
 	if err := os.WriteFile(config.Output, []byte(output), 0644); err != nil {
-		log.Fatalf("Error writing output file: %v", err)
+		return fmt.Errorf("writing output file: %w", err)
 	}
 
 	log.Printf("-> Wrote output to %s", config.Output)
 	log.Printf("Paperboy finished")
+
+	return nil
 }
 
 // loadConfig reads and validates the YAML configuration.

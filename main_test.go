@@ -6,6 +6,9 @@
 package main
 
 import (
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -512,6 +515,48 @@ func TestGenerateMarkdownTitleCannotRelink(t *testing.T) {
 	}
 	if want := "- 2026-01-01 @ a.example: \\<https://evil.example/phish>"; items[0] != want {
 		t.Errorf("item = %q, want %q", items[0], want)
+	}
+}
+
+// writeRunConfig writes a valid template and a config naming feeds, the
+// template and output, returning the config path. Paths are absolute, so run
+// does not depend on the test's working directory.
+func writeRunConfig(t *testing.T, output string, feeds ...string) string {
+	t.Helper()
+
+	template := writeTemp(t, "template.md", "# Head\n\n---\n\n---\n\nFoot\n")
+
+	var b strings.Builder
+	b.WriteString("feeds:\n")
+	for _, feed := range feeds {
+		fmt.Fprintf(&b, "  - %q\n", feed)
+	}
+	fmt.Fprintf(&b, "template: %q\noutput: %q\n", template, output)
+
+	return writeTemp(t, "config.yaml", b.String())
+}
+
+// TestRunAllFeedsFailedKeepsOutput is the regression test for the fail-open
+// run: with every feed down it used to overwrite the last digest with an empty
+// one and exit 0, so a cron job mailed an empty newsletter.
+func TestRunAllFeedsFailedKeepsOutput(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "down", http.StatusInternalServerError)
+	}))
+	t.Cleanup(srv.Close)
+
+	output := writeTemp(t, "output.md", "previous digest\n")
+
+	if err := run(writeRunConfig(t, output, srv.URL+"/a", srv.URL+"/b")); err == nil {
+		t.Fatal("run returned nil with every feed failing, want an error")
+	}
+
+	got, err := os.ReadFile(output)
+	if err != nil {
+		t.Fatalf("reading output: %v", err)
+	}
+	if string(got) != "previous digest\n" {
+		t.Errorf("output = %q, want the previous digest left untouched", got)
 	}
 }
 
