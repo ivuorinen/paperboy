@@ -449,6 +449,48 @@ func TestGenerateMarkdownRejectsUnsafeLink(t *testing.T) {
 	}
 }
 
+// TestGenerateMarkdownOptionalFields covers items without a title or a link,
+// both valid in RSS 2.0. An empty title used to render "[](url)", an anchor
+// with no visible text, and an empty domain rendered as "@ :".
+func TestGenerateMarkdownOptionalFields(t *testing.T) {
+	cases := []struct {
+		name    string
+		article Article
+		want    string
+	}{
+		{
+			"untitled",
+			Article{URL: "https://a.example/1", URLDomain: "a.example"},
+			"- 2026-01-01 @ a.example: [(untitled)](https://a.example/1)",
+		},
+		{
+			"whitespace-only title",
+			Article{Title: " \n\t", URL: "https://a.example/1", URLDomain: "a.example"},
+			"- 2026-01-01 @ a.example: [(untitled)](https://a.example/1)",
+		},
+		{
+			"no link",
+			Article{Title: "No link item"},
+			"- 2026-01-01: No link item",
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			c.article.PublishAt = mustTime(t, "2026-01-01T00:00:00Z")
+			got := generateMarkdown("HEAD", "FOOT", map[string][]Article{"2026-01": {c.article}}, []string{"2026-01"})
+
+			items := linesWithPrefix(got, "- ")
+			if len(items) != 1 {
+				t.Fatalf("got %d list-item lines, want 1\n---\n%s", len(items), got)
+			}
+			if items[0] != c.want {
+				t.Errorf("item = %q, want %q", items[0], c.want)
+			}
+		})
+	}
+}
+
 // TestGenerateMarkdownTitleCannotRelink covers the plain-text branch: an item
 // whose link is rejected must stay unlinked, so its title must not be able to
 // reintroduce a link as a CommonMark autolink.

@@ -290,17 +290,28 @@ func generateMarkdown(header, footer string, articlesByWeek map[string][]Article
 		fmt.Fprintf(&output, "## Week: %s\n\n", week)
 
 		for _, article := range articles {
-			date := article.PublishAt.Format("2006-01-02")
+			// The "@ domain" part is omitted for an item with no link to take
+			// a domain from; otherwise the line read "@ :".
+			prefix := article.PublishAt.Format("2006-01-02")
+			if article.URLDomain != "" {
+				prefix += " @ " + article.URLDomain
+			}
+
+			// RSS 2.0 allows items without a title, and an empty label renders
+			// as an anchor with no visible text.
 			title := mdText(article.Title)
+			if title == "" {
+				title = "(untitled)"
+			}
 
 			// A link that is not a plain absolute http(s) URL is dropped
 			// rather than rendered, leaving the entry as plain text.
 			if link := mdURL(article.URL); link != "" {
-				fmt.Fprintf(&output, "- %s @ %s: [%s](%s)\n", date, article.URLDomain, title, link)
+				fmt.Fprintf(&output, "- %s: [%s](%s)\n", prefix, title, link)
 				continue
 			}
 
-			fmt.Fprintf(&output, "- %s @ %s: %s\n", date, article.URLDomain, title)
+			fmt.Fprintf(&output, "- %s: %s\n", prefix, title)
 		}
 
 		output.WriteString("\n")
