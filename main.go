@@ -45,7 +45,11 @@ const maxFeedBytes = 16 << 20
 // domainRe matches the trailing dotted-label sequence of a host. Compiled once
 // at package scope: MustCompile panics on a bad pattern, which belongs at
 // startup rather than part-way through a run.
-var domainRe = regexp.MustCompile(`([a-z0-9\-]+\.)+[a-z0-9\-]+`)
+//
+// Labels are Unicode letters, digits, "_" and "-": url.Parse keeps IDN hosts in
+// Unicode, and an ASCII-only class matched from after the last non-ASCII rune,
+// turning "bücher.example" into the plausible but wrong "cher.example".
+var domainRe = regexp.MustCompile(`([\p{L}\p{N}_-]+\.)+[\p{L}\p{N}_-]+`)
 
 // mdTextEscaper escapes the brackets that would close a Markdown link label
 // early, letting remote text break out of the label it is placed in.

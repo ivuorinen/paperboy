@@ -130,6 +130,12 @@ func TestGetURLDomain(t *testing.T) {
 		{"malformed percent escape", "https://example.com/%zz", "example.com"},
 		// Regression: the old `^https?` regexp matched this and produced "".
 		{"http-prefixed non-URL", "httpfoo.example.com", "httpfoo.example.com"},
+		// url.Parse keeps IDN hosts in Unicode; an ASCII-only pattern
+		// matched from after the last non-ASCII rune, yielding the plausible
+		// but wrong "cher.example" and "ller.example".
+		{"IDN host", "https://bücher.example/post", "bücher.example"},
+		{"IDN host with www", "https://www.müller.example/a", "müller.example"},
+		{"underscore label", "https://my_blog.example.com/a", "my_blog.example.com"},
 		{"empty", "", ""},
 		{"no domain present", "not a url", ""},
 	})
