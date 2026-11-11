@@ -51,6 +51,12 @@ const maxFeedBytes = 16 << 20
 // turning "bücher.example" into the plausible but wrong "cher.example".
 var domainRe = regexp.MustCompile(`([\p{L}\p{N}_-]+\.)+[\p{L}\p{N}_-]+`)
 
+// templateSep matches a template separator: a line holding only "---", with
+// optional trailing blanks and a CRLF ending. Splitting on the bare substring
+// also cut at "---" mid-line and inside longer horizontal rules such as
+// "----", silently dropping the header text in between.
+var templateSep = regexp.MustCompile(`(?m)^---[ \t]*\r?$`)
+
 // mdTextEscaper escapes the brackets that would close a Markdown link label
 // early, letting remote text break out of the label it is placed in.
 //
@@ -204,7 +210,7 @@ func loadTemplate(path string) (header, footer string, err error) {
 		return "", "", fmt.Errorf("reading template %s: %w", path, err)
 	}
 
-	parts := strings.SplitN(string(data), "---", 3)
+	parts := templateSep.Split(string(data), 3)
 	if len(parts) != 3 {
 		return "", "", fmt.Errorf(
 			"template %s: want a header and footer separated by two --- lines, found %d section(s)",

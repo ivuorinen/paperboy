@@ -288,6 +288,46 @@ func TestLoadTemplateValid(t *testing.T) {
 	}
 }
 
+// TestLoadTemplateSplitsOnSeparatorLinesOnly is the regression test for the
+// substring split: a "---" anywhere, mid-line or inside a longer horizontal
+// rule, used to count as a separator and silently drop header text.
+func TestLoadTemplateSplitsOnSeparatorLinesOnly(t *testing.T) {
+	cases := []struct {
+		name, template, header, footer string
+	}{
+		{
+			"mid-line dashes",
+			"# Weekly\n\nIntro --- read on\n\n---\n\n---\n\nFooter\n",
+			"# Weekly\n\nIntro --- read on", "Footer",
+		},
+		{
+			"longer horizontal rule",
+			"# Weekly\n\n----\n\nIntro paragraph\n\n---\n\n---\n\nFooter\n",
+			"# Weekly\n\n----\n\nIntro paragraph", "Footer",
+		},
+		{
+			"CRLF line endings",
+			"# Weekly\r\n\r\n---\r\n\r\n---\r\n\r\nFooter\r\n",
+			"# Weekly", "Footer",
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			header, footer, err := loadTemplate(writeTemp(t, "template.md", c.template))
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if header != c.header {
+				t.Errorf("header = %q, want %q", header, c.header)
+			}
+			if footer != c.footer {
+				t.Errorf("footer = %q, want %q", footer, c.footer)
+			}
+		})
+	}
+}
+
 func TestLoadTemplateRejectsBadInput(t *testing.T) {
 	t.Run("too few separators", func(t *testing.T) {
 		path := writeTemp(t, "template.md", "# Header\n\n---\n\nFooter\n")
