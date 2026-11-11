@@ -24,7 +24,7 @@ import (
 	"time"
 
 	"github.com/mmcdole/gofeed"
-	"gopkg.in/yaml.v3"
+	"go.yaml.in/yaml/v3"
 )
 
 // version and build are stamped by the linker; see the build target in the
