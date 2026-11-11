@@ -59,4 +59,4 @@ config's directory first (or use `-config` with absolute paths):
 
 ## License
 
-The MIT License (MIT) - see [LICENSE](LICENSE.md) for more details
+The MIT License (MIT) - see [LICENSE](../LICENSE.md) for more details
