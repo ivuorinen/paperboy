@@ -7,12 +7,13 @@ on:
   pull_request:
     branches: ["main"]
 
+# Nothing at workflow level: a job without its own permissions block gets no
+# token scope at all, so each job below opts into exactly what it needs.
+permissions: {}
+
 jobs:
   test-build-and-run:
     runs-on: ubuntu-latest
-    # Declared per job rather than once at workflow level: a job-level block is
-    # explicit about what that job may do, and a new job cannot silently
-    # inherit a scope nobody chose for it.
     permissions:
       contents: read
     steps:
