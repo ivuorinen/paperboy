@@ -59,7 +59,14 @@ var domainRe = regexp.MustCompile(`([a-z0-9\-]+\.)+[a-z0-9\-]+`)
 // evil.example rather than at the article. strings.NewReplacer does not
 // rescan its own output, so escaping the escape character in the same
 // Replacer is correct and does not double-apply.
-var mdTextEscaper = strings.NewReplacer(`\`, `\\`, "[", `\[`, "]", `\]`)
+//
+// "<" is escaped because CommonMark raw HTML and autolinks both open with it
+// and bind tighter than link brackets, so bracket escaping alone does not stop
+// them. Unescaped, a feed title `<https://evil.example/phish>` rendered as a
+// live link even under goldmark's safe defaults, and `<img onerror=...>` or
+// `<h1>` passed through any renderer that allows raw HTML. A backslash-escaped
+// "<" is literal text, which disables both constructs.
+var mdTextEscaper = strings.NewReplacer(`\`, `\\`, "[", `\[`, "]", `\]`, "<", `\<`)
 
 // mdURLEscaper percent-encodes the characters that would terminate a Markdown
 // link target early. net/url leaves parentheses unescaped in paths, since they

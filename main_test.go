@@ -147,6 +147,11 @@ func TestMdText(t *testing.T) {
 		// supply its own destination.
 		{"backslash escaped", `Title\`, `Title\\`},
 		{"retarget payload", `x\](https://evil.example)`, `x\\\](https://evil.example)`},
+		// Raw HTML and autolinks both open with "<" and bind tighter than
+		// link brackets, so an unescaped "<" smuggles markup or a live link
+		// past the bracket escaping above.
+		{"raw html escaped", `<img src=x onerror=alert(1)>`, `\<img src=x onerror=alert(1)>`},
+		{"autolink escaped", `<https://evil.example/phish>`, `\<https://evil.example/phish>`},
 		{"empty", "", ""},
 	})
 }
@@ -395,6 +400,30 @@ func TestGenerateMarkdownRejectsUnsafeLink(t *testing.T) {
 	}
 	if !strings.Contains(got, "Sketchy") {
 		t.Errorf("title dropped along with the link\n---\n%s", got)
+	}
+}
+
+// TestGenerateMarkdownTitleCannotRelink covers the plain-text branch: an item
+// whose link is rejected must stay unlinked, so its title must not be able to
+// reintroduce a link as a CommonMark autolink.
+func TestGenerateMarkdownTitleCannotRelink(t *testing.T) {
+	byWeek := map[string][]Article{
+		"2026-01": {{
+			Title:     "<https://evil.example/phish>",
+			URL:       "javascript:alert(1)",
+			URLDomain: "a.example",
+			PublishAt: mustTime(t, "2026-01-01T00:00:00Z"),
+		}},
+	}
+
+	got := generateMarkdown("HEAD", "FOOT", byWeek, []string{"2026-01"})
+
+	items := linesWithPrefix(got, "- ")
+	if len(items) != 1 {
+		t.Fatalf("got %d list-item lines, want 1\n---\n%s", len(items), got)
+	}
+	if want := "- 2026-01-01 @ a.example: \\<https://evil.example/phish>"; items[0] != want {
+		t.Errorf("item = %q, want %q", items[0], want)
 	}
 }
 
