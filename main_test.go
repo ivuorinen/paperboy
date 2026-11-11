@@ -560,6 +560,111 @@ func TestRunAllFeedsFailedKeepsOutput(t *testing.T) {
 	}
 }
 
+// TestWriteFileAtomicReplacesWholeFile pins the rename-over semantics. A reader
+// holding the old file keeps the old bytes only if the path was swapped to a
+// new file; os.WriteFile truncates the same inode in place, which is what let a
+// failed write destroy the previous digest.
+func TestWriteFileAtomicReplacesWholeFile(t *testing.T) {
+	path := writeTemp(t, "output.md", "previous digest\n")
+
+	old, err := os.Open(path)
+	if err != nil {
+		t.Fatalf("opening old output: %v", err)
+	}
+	t.Cleanup(func() { _ = old.Close() })
+
+	if err := writeFileAtomic(path, []byte("new digest\n")); err != nil {
+		t.Fatalf("writeFileAtomic: %v", err)
+	}
+
+	stale := make([]byte, 64)
+	n, _ := old.Read(stale)
+	if got := string(stale[:n]); got != "previous digest\n" {
+		t.Errorf("reader of the old file saw %q, want the old bytes intact", got)
+	}
+
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading new output: %v", err)
+	}
+	if string(got) != "new digest\n" {
+		t.Errorf("output = %q, want %q", got, "new digest\n")
+	}
+
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat output: %v", err)
+	}
+	if mode := info.Mode().Perm(); mode != 0o644 {
+		t.Errorf("output mode = %o, want 644 so the mailing step can read it", mode)
+	}
+
+	assertNoTempFiles(t, filepath.Dir(path))
+}
+
+// TestWriteFileAtomicCleansUpOnFailure renames onto a directory, which fails
+// after the temp file exists; the temp file must not be left behind.
+func TestWriteFileAtomicCleansUpOnFailure(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "output.md")
+	if err := os.Mkdir(target, 0o755); err != nil {
+		t.Fatalf("creating blocking directory: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(target, "keep"), nil, 0o600); err != nil {
+		t.Fatalf("populating blocking directory: %v", err)
+	}
+
+	if err := writeFileAtomic(target, []byte("x")); err == nil {
+		t.Fatal("writeFileAtomic onto a non-empty directory returned nil, want an error")
+	}
+
+	assertNoTempFiles(t, dir)
+}
+
+// TestWriteFileAtomicFollowsSymlink keeps a symlinked output working: os.WriteFile
+// wrote through the link, and a bare rename onto the link path would replace
+// the link itself with a regular file, so the real target stops updating.
+func TestWriteFileAtomicFollowsSymlink(t *testing.T) {
+	target := writeTemp(t, "served.md", "previous digest\n")
+	link := filepath.Join(t.TempDir(), "output.md")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatalf("creating symlink: %v", err)
+	}
+
+	if err := writeFileAtomic(link, []byte("new digest\n")); err != nil {
+		t.Fatalf("writeFileAtomic: %v", err)
+	}
+
+	info, err := os.Lstat(link)
+	if err != nil {
+		t.Fatalf("lstat link: %v", err)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		t.Errorf("output path is now a %v, want it to stay a symlink", info.Mode().Type())
+	}
+
+	got, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatalf("reading target: %v", err)
+	}
+	if string(got) != "new digest\n" {
+		t.Errorf("symlink target = %q, want %q", got, "new digest\n")
+	}
+}
+
+// assertNoTempFiles fails if writeFileAtomic left a temp file in dir.
+func assertNoTempFiles(t *testing.T, dir string) {
+	t.Helper()
+
+	leftovers, err := filepath.Glob(filepath.Join(dir, ".paperboy-*"))
+	if err != nil {
+		t.Fatalf("globbing temp files: %v", err)
+	}
+	if len(leftovers) != 0 {
+		t.Errorf("temp files left behind: %v", leftovers)
+	}
+}
+
 func TestGenerateMarkdownNoArticles(t *testing.T) {
 	got := generateMarkdown("HEAD", "FOOT", map[string][]Article{}, nil)
 

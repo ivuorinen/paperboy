@@ -18,6 +18,7 @@ import (
 	"maps"
 	"net/url"
 	"os"
+	"path/filepath"
 	"regexp"
 	"slices"
 	"strings"
@@ -176,7 +177,7 @@ func run(configFile string) error {
 
 	log.Printf("-> Generated Markdown output")
 
-	if err := os.WriteFile(config.Output, []byte(output), 0644); err != nil {
+	if err := writeFileAtomic(config.Output, []byte(output)); err != nil {
 		return fmt.Errorf("writing output file: %w", err)
 	}
 
@@ -184,6 +185,50 @@ func run(configFile string) error {
 	log.Printf("Paperboy finished")
 
 	return nil
+}
+
+// writeFileAtomic replaces path with data so a reader sees either the old file
+// or the new one, never a truncated mix. os.WriteFile truncates in place, so a
+// failure after the truncate (ENOSPC, a kill mid-write) destroyed the previous
+// digest. The temp file is created beside path because rename is atomic only
+// within one filesystem, and it is removed on any failure. The result is always
+// mode 0644: CreateTemp makes 0600, and the digest is meant to be read by
+// whatever mails or publishes it.
+//
+// A symlinked path is resolved first, so the link's target is replaced as
+// os.WriteFile would have written through it; renaming onto the link path
+// would swap the link itself for a regular file. Unlike os.WriteFile, this
+// needs write access to the target's directory, not just to the file.
+func writeFileAtomic(path string, data []byte) (err error) {
+	if resolved, evalErr := filepath.EvalSymlinks(path); evalErr == nil {
+		path = resolved
+	}
+
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".paperboy-*")
+	if err != nil {
+		return err
+	}
+
+	defer func() {
+		if err != nil {
+			_ = os.Remove(tmp.Name())
+		}
+	}()
+
+	if _, err = tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+
+	if err = tmp.Close(); err != nil {
+		return err
+	}
+
+	if err = os.Chmod(tmp.Name(), 0o644); err != nil {
+		return err
+	}
+
+	return os.Rename(tmp.Name(), path)
 }
 
 // loadConfig reads and validates the YAML configuration.
