@@ -193,6 +193,13 @@ func run(configFile string) error {
 // digest. The temp file is created beside path because rename is atomic only
 // within one filesystem, and it is removed on any failure.
 //
+// A first run has no old file to protect. The open below creates an empty
+// one, which a reader can see until the rename and which stays if a later
+// step fails, much as os.WriteFile's partial write did. Avoiding it would
+// mean resolving a dangling link chain by hand and making the temp file
+// without CreateTemp to keep the umask, for a window that only exists before
+// the first digest.
+//
 // The replacement takes the current file's mode, which os.WriteFile kept by
 // never recreating the file. CreateTemp makes 0600, and forcing any fixed mode
 // instead would widen a private digest or override the umask. A first run
