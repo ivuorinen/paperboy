@@ -6,6 +6,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -734,7 +735,10 @@ func TestWriteFileAtomicReplacesWholeFile(t *testing.T) {
 }
 
 // TestWriteFileAtomicCleansUpOnFailure renames onto a directory, which fails
-// after the temp file exists; the temp file must not be left behind.
+// after the temp file exists; the temp file must not be left behind. The
+// error must come from the rename (*os.LinkError): a failure any earlier, such
+// as an open of the directory, would pass the leftover check without the
+// cleanup ever running.
 func TestWriteFileAtomicCleansUpOnFailure(t *testing.T) {
 	dir := t.TempDir()
 	target := filepath.Join(dir, "output.md")
@@ -745,11 +749,44 @@ func TestWriteFileAtomicCleansUpOnFailure(t *testing.T) {
 		t.Fatalf("populating blocking directory: %v", err)
 	}
 
-	if err := writeFileAtomic(target, []byte("x")); err == nil {
-		t.Fatal("writeFileAtomic onto a non-empty directory returned nil, want an error")
+	err := writeFileAtomic(target, []byte("x"))
+	var linkErr *os.LinkError
+	if !errors.As(err, &linkErr) {
+		t.Fatalf("writeFileAtomic onto a non-empty directory = %v, want the rename's *os.LinkError", err)
 	}
 
 	assertNoTempFiles(t, dir)
+}
+
+// TestWriteFileAtomicKeepsReadOnlyOutput covers an output its operator made
+// read-only. os.WriteFile failed to open it for writing, while a rename needs
+// only the directory's write permission, so without a check on the file
+// itself the protected digest was silently replaced. Root bypasses permission
+// bits, so the test cannot observe the check when run as root.
+func TestWriteFileAtomicKeepsReadOnlyOutput(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses file permission bits")
+	}
+
+	path := writeTemp(t, "output.md", "previous digest\n")
+	if err := os.Chmod(path, 0o444); err != nil {
+		t.Fatalf("making output read-only: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(path, 0o600) })
+
+	if err := writeFileAtomic(path, []byte("new digest\n")); err == nil {
+		t.Fatal("writeFileAtomic replaced a read-only output, want an error")
+	}
+
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading output: %v", err)
+	}
+	if string(got) != "previous digest\n" {
+		t.Errorf("output = %q, want the read-only digest left untouched", got)
+	}
+
+	assertNoTempFiles(t, filepath.Dir(path))
 }
 
 // TestWriteFileAtomicFollowsSymlink keeps a symlinked output working: os.WriteFile

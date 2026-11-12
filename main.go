@@ -200,15 +200,19 @@ func run(configFile string) error {
 //
 // A symlinked path is resolved first, so the link's target is replaced as
 // os.WriteFile would have written through it; renaming onto the link path
-// would swap the link itself for a regular file. A path that does not exist
-// yet, including the not-yet-written target of a link set up before the
-// first run, is created first through an O_CREATE open, so the kernel
-// resolves the link exactly as os.WriteFile's open did. Without that,
-// EvalSymlinks fails on a dangling link and the rename replaces the link.
-// Unlike os.WriteFile, this needs write access to the target's directory,
-// not just to the file.
+// would swap the link itself for a regular file.
+//
+// A missing path or an existing regular file is first opened for writing,
+// with O_CREATE and no O_TRUNC, the open os.WriteFile made. The kernel then
+// resolves a link as before and creates a missing target, including the
+// not-yet-written target of a link set up before the first run; without it,
+// EvalSymlinks fails on a dangling link and the rename replaces the link. The
+// same open makes a read-only output fail as it did under os.WriteFile,
+// where a rename alone needs only the directory's write permission. A
+// directory skips the open and fails at the rename. Writing therefore needs
+// write access to the file, as os.WriteFile did, and to its directory.
 func writeFileAtomic(path string, data []byte) (err error) {
-	if _, statErr := os.Stat(path); errors.Is(statErr, os.ErrNotExist) {
+	if info, statErr := os.Stat(path); errors.Is(statErr, os.ErrNotExist) || (statErr == nil && info.Mode().IsRegular()) {
 		var f *os.File
 		if f, err = os.OpenFile(path, os.O_WRONLY|os.O_CREATE, 0o644); err != nil {
 			return err
