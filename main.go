@@ -191,9 +191,12 @@ func run(configFile string) error {
 // or the new one, never a truncated mix. os.WriteFile truncates in place, so a
 // failure after the truncate (ENOSPC, a kill mid-write) destroyed the previous
 // digest. The temp file is created beside path because rename is atomic only
-// within one filesystem, and it is removed on any failure. The result is always
-// mode 0644: CreateTemp makes 0600, and the digest is meant to be read by
-// whatever mails or publishes it.
+// within one filesystem, and it is removed on any failure.
+//
+// The replacement takes the current file's mode, which os.WriteFile kept by
+// never recreating the file. CreateTemp makes 0600, and forcing any fixed mode
+// instead would widen a private digest or override the umask. A first run
+// gets os.WriteFile's 0644 narrowed by the umask, from the O_CREATE open below.
 //
 // A symlinked path is resolved first, so the link's target is replaced as
 // os.WriteFile would have written through it; renaming onto the link path
@@ -220,6 +223,11 @@ func writeFileAtomic(path string, data []byte) (err error) {
 		return err
 	}
 
+	current, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+
 	tmp, err := os.CreateTemp(filepath.Dir(path), ".paperboy-*")
 	if err != nil {
 		return err
@@ -240,7 +248,7 @@ func writeFileAtomic(path string, data []byte) (err error) {
 		return err
 	}
 
-	if err = os.Chmod(tmp.Name(), 0o644); err != nil {
+	if err = os.Chmod(tmp.Name(), current.Mode().Perm()); err != nil {
 		return err
 	}
 

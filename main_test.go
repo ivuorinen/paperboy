@@ -688,8 +688,15 @@ func TestRunCapsFeedSize(t *testing.T) {
 // holding the old file keeps the old bytes only if the path was swapped to a
 // new file; os.WriteFile truncates the same inode in place, which is what let a
 // failed write destroy the previous digest.
+//
+// The replacement also keeps the old file's mode, as os.WriteFile did by never
+// recreating it. 0640 differs from both CreateTemp's 0600 and a forced 0644,
+// so neither leaving the temp file's mode nor overriding it passes.
 func TestWriteFileAtomicReplacesWholeFile(t *testing.T) {
 	path := writeTemp(t, "output.md", "previous digest\n")
+	if err := os.Chmod(path, 0o640); err != nil {
+		t.Fatalf("setting output mode: %v", err)
+	}
 
 	old, err := os.Open(path)
 	if err != nil {
@@ -719,8 +726,8 @@ func TestWriteFileAtomicReplacesWholeFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("stat output: %v", err)
 	}
-	if mode := info.Mode().Perm(); mode != 0o644 {
-		t.Errorf("output mode = %o, want 644 so the mailing step can read it", mode)
+	if mode := info.Mode().Perm(); mode != 0o640 {
+		t.Errorf("output mode = %o, want the existing file's 640 kept", mode)
 	}
 
 	assertNoTempFiles(t, filepath.Dir(path))
