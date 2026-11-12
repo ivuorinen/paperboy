@@ -59,10 +59,12 @@ jobs:
       - name: Setup default template and config
         run: cp examples/* .
 
-      # Smoke test only: this fetches live third-party feeds, so it is not a
-      # correctness signal. A failing feed is logged and skipped by design; the
-      # step fails only when every feed is unreachable, which paperboy reports
-      # with a non-zero exit. The go test step above is what gates the build.
+      # Live run against the example feeds. A failing feed is logged and
+      # skipped, so one third-party outage does not fail this step. It fails
+      # when paperboy cannot load the example config and template, which no
+      # test reads, or cannot fetch any of the six feeds: six independent hosts
+      # down at once means paperboy itself cannot fetch, which the offline
+      # tests cannot see.
       - name: Run program
         run: ./paperboy
 
