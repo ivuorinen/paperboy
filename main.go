@@ -197,11 +197,27 @@ func run(configFile string) error {
 //
 // A symlinked path is resolved first, so the link's target is replaced as
 // os.WriteFile would have written through it; renaming onto the link path
-// would swap the link itself for a regular file. Unlike os.WriteFile, this
-// needs write access to the target's directory, not just to the file.
+// would swap the link itself for a regular file. A path that does not exist
+// yet, including the not-yet-written target of a link set up before the
+// first run, is created first through an O_CREATE open, so the kernel
+// resolves the link exactly as os.WriteFile's open did. Without that,
+// EvalSymlinks fails on a dangling link and the rename replaces the link.
+// Unlike os.WriteFile, this needs write access to the target's directory,
+// not just to the file.
 func writeFileAtomic(path string, data []byte) (err error) {
-	if resolved, evalErr := filepath.EvalSymlinks(path); evalErr == nil {
-		path = resolved
+	if _, statErr := os.Stat(path); errors.Is(statErr, os.ErrNotExist) {
+		var f *os.File
+		if f, err = os.OpenFile(path, os.O_WRONLY|os.O_CREATE, 0o644); err != nil {
+			return err
+		}
+
+		if err = f.Close(); err != nil {
+			return err
+		}
+	}
+
+	if path, err = filepath.EvalSymlinks(path); err != nil {
+		return err
 	}
 
 	tmp, err := os.CreateTemp(filepath.Dir(path), ".paperboy-*")

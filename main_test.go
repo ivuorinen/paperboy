@@ -748,31 +748,50 @@ func TestWriteFileAtomicCleansUpOnFailure(t *testing.T) {
 // TestWriteFileAtomicFollowsSymlink keeps a symlinked output working: os.WriteFile
 // wrote through the link, and a bare rename onto the link path would replace
 // the link itself with a regular file, so the real target stops updating.
+//
+// The dangling case is a link set up before the first run, pointing at a
+// digest that does not exist yet: os.WriteFile created the target through it.
 func TestWriteFileAtomicFollowsSymlink(t *testing.T) {
-	target := writeTemp(t, "served.md", "previous digest\n")
-	link := filepath.Join(t.TempDir(), "output.md")
-	if err := os.Symlink(target, link); err != nil {
-		t.Fatalf("creating symlink: %v", err)
+	cases := []struct {
+		name   string
+		target func(t *testing.T) string
+	}{
+		{"existing target", func(t *testing.T) string {
+			return writeTemp(t, "served.md", "previous digest\n")
+		}},
+		{"dangling link", func(t *testing.T) string {
+			return filepath.Join(t.TempDir(), "served.md")
+		}},
 	}
 
-	if err := writeFileAtomic(link, []byte("new digest\n")); err != nil {
-		t.Fatalf("writeFileAtomic: %v", err)
-	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			target := c.target(t)
+			link := filepath.Join(t.TempDir(), "output.md")
+			if err := os.Symlink(target, link); err != nil {
+				t.Fatalf("creating symlink: %v", err)
+			}
 
-	info, err := os.Lstat(link)
-	if err != nil {
-		t.Fatalf("lstat link: %v", err)
-	}
-	if info.Mode()&os.ModeSymlink == 0 {
-		t.Errorf("output path is now a %v, want it to stay a symlink", info.Mode().Type())
-	}
+			if err := writeFileAtomic(link, []byte("new digest\n")); err != nil {
+				t.Fatalf("writeFileAtomic: %v", err)
+			}
 
-	got, err := os.ReadFile(target)
-	if err != nil {
-		t.Fatalf("reading target: %v", err)
-	}
-	if string(got) != "new digest\n" {
-		t.Errorf("symlink target = %q, want %q", got, "new digest\n")
+			info, err := os.Lstat(link)
+			if err != nil {
+				t.Fatalf("lstat link: %v", err)
+			}
+			if info.Mode()&os.ModeSymlink == 0 {
+				t.Errorf("output path is now a %v, want it to stay a symlink", info.Mode().Type())
+			}
+
+			got, err := os.ReadFile(target)
+			if err != nil {
+				t.Fatalf("reading target: %v", err)
+			}
+			if string(got) != "new digest\n" {
+				t.Errorf("symlink target = %q, want %q", got, "new digest\n")
+			}
+		})
 	}
 }
 
