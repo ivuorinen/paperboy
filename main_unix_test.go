@@ -109,3 +109,56 @@ func TestWriteOutputReplacesRegularFileAtomically(t *testing.T) {
 		t.Errorf("output = %q, %v; want %q", got, err, "new digest\n")
 	}
 }
+
+// TestWriteFileAtomicKeepsGroup covers an output whose group is not the
+// process's own, such as a root:mail 0640 digest written by a root cron job.
+// os.WriteFile kept the file and so its group. The renamed temp file took the
+// process's group instead, and the old group lost read access.
+func TestWriteFileAtomicKeepsGroup(t *testing.T) {
+	other := supplementaryGroup(t)
+
+	path := filepath.Join(t.TempDir(), "output.md")
+	if err := os.WriteFile(path, []byte("old digest\n"), 0o640); err != nil {
+		t.Fatalf("seed output: %v", err)
+	}
+	if err := os.Chown(path, -1, other); err != nil {
+		t.Fatalf("chown output: %v", err)
+	}
+
+	if err := writeFileAtomic(path, []byte("new digest\n")); err != nil {
+		t.Fatalf("writeFileAtomic: %v", err)
+	}
+
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat output: %v", err)
+	}
+	st, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		t.Fatalf("stat output: Sys() is %T, want *syscall.Stat_t", info.Sys())
+	}
+	if gid := int(st.Gid); gid != other {
+		t.Errorf("output group = %d, want %d", gid, other)
+	}
+}
+
+// supplementaryGroup returns a group the process is in besides its effective
+// one, which it may set on its own files without root, or skips the test.
+func supplementaryGroup(t *testing.T) int {
+	t.Helper()
+
+	groups, err := os.Getgroups()
+	if err != nil {
+		t.Fatalf("getgroups: %v", err)
+	}
+
+	for _, gid := range groups {
+		if gid != os.Getegid() {
+			return gid
+		}
+	}
+
+	t.Skip("the process is in no supplementary group, so it cannot set another group")
+
+	return -1
+}

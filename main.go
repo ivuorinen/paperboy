@@ -214,10 +214,14 @@ func writeOutput(path string, data []byte) error {
 // without CreateTemp to keep the umask, for a window that only exists before
 // the first digest.
 //
-// The replacement takes the current file's mode, which os.WriteFile kept by
-// never recreating the file. CreateTemp makes 0600, and forcing any fixed mode
-// instead would widen a private digest or override the umask. A first run
-// gets os.WriteFile's 0644 narrowed by the umask, from openLikeWriteFile.
+// The replacement takes the current file's mode, owner and group, which
+// os.WriteFile kept by never recreating the file. CreateTemp makes 0600, and
+// forcing any fixed mode instead would widen a private digest or override the
+// umask. A first run gets os.WriteFile's 0644 narrowed by the umask, from
+// openLikeWriteFile. An output owned by another user, or by a group the
+// process is not in, therefore needs root to write, where os.WriteFile needed
+// only write access to the file; see keepOwner. ACLs, extended attributes and
+// further hard links are not carried over.
 //
 // A symlinked path is resolved first, so the link's target is replaced as
 // os.WriteFile would have written through it; renaming onto the link path
@@ -254,6 +258,10 @@ func writeFileAtomic(path string, data []byte) (err error) {
 	}
 
 	if err = tmp.Close(); err != nil {
+		return err
+	}
+
+	if err = keepOwner(tmp.Name(), current); err != nil {
 		return err
 	}
 
