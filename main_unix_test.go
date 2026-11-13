@@ -49,21 +49,7 @@ func TestWriteOutputWritesThroughFIFO(t *testing.T) {
 
 	// A non-blocking reader lets the write open the pipe without waiting, and
 	// reads EOF at once if nothing ever opens the pipe for writing.
-	reader, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
-	if err != nil {
-		t.Fatalf("open reader: %v", err)
-	}
-	t.Cleanup(func() { _ = reader.Close() })
-
-	if err := writeOutput(path, []byte("digest\n")); err != nil {
-		t.Fatalf("writeOutput: %v", err)
-	}
-
-	got, err := io.ReadAll(reader)
-	if err != nil {
-		t.Fatalf("read pipe: %v", err)
-	}
-	if string(got) != "digest\n" {
+	if got := readAcrossWriteOutput(t, path, syscall.O_NONBLOCK, "digest\n"); got != "digest\n" {
 		t.Errorf("pipe reader got %q, want %q", got, "digest\n")
 	}
 
@@ -87,27 +73,36 @@ func TestWriteOutputReplacesRegularFileAtomically(t *testing.T) {
 		t.Fatalf("seed output: %v", err)
 	}
 
-	reader, err := os.Open(path)
-	if err != nil {
-		t.Fatalf("open reader: %v", err)
-	}
-	t.Cleanup(func() { _ = reader.Close() })
-
-	if err := writeOutput(path, []byte("new digest\n")); err != nil {
-		t.Fatalf("writeOutput: %v", err)
-	}
-
-	got, err := io.ReadAll(reader)
-	if err != nil {
-		t.Fatalf("read old output: %v", err)
-	}
-	if string(got) != "old digest\n" {
+	if got := readAcrossWriteOutput(t, path, 0, "new digest\n"); got != "old digest\n" {
 		t.Errorf("reader of the old output got %q, want %q: the output was rewritten in place", got, "old digest\n")
 	}
 
 	if got, err := os.ReadFile(path); err != nil || string(got) != "new digest\n" {
 		t.Errorf("output = %q, %v; want %q", got, err, "new digest\n")
 	}
+}
+
+// readAcrossWriteOutput opens path for reading with the extra open flag, runs
+// writeOutput with data, and returns what that already-open reader then reads.
+func readAcrossWriteOutput(t *testing.T, path string, flag int, data string) string {
+	t.Helper()
+
+	reader, err := os.OpenFile(path, os.O_RDONLY|flag, 0)
+	if err != nil {
+		t.Fatalf("open reader: %v", err)
+	}
+	t.Cleanup(func() { _ = reader.Close() })
+
+	if err := writeOutput(path, []byte(data)); err != nil {
+		t.Fatalf("writeOutput: %v", err)
+	}
+
+	got, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+
+	return string(got)
 }
 
 // TestWriteFileAtomicKeepsGroup covers an output whose group is not the
