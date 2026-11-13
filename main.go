@@ -177,7 +177,7 @@ func run(configFile string) error {
 
 	log.Printf("-> Generated Markdown output")
 
-	if err := writeFileAtomic(config.Output, []byte(output)); err != nil {
+	if err := writeOutput(config.Output, []byte(output)); err != nil {
 		return fmt.Errorf("writing output file: %w", err)
 	}
 
@@ -185,6 +185,20 @@ func run(configFile string) error {
 	log.Printf("Paperboy finished")
 
 	return nil
+}
+
+// writeOutput writes the digest to path. An existing path that is not a
+// regular file, such as a FIFO or a device, is written in place with
+// os.WriteFile, as before writeFileAtomic existed: a rename would remove the
+// node, so a reader on the pipe, or an output such as /dev/stdout, would get
+// nothing while the run reported success. A directory fails there, as it did
+// then. A regular file or a missing path goes to writeFileAtomic.
+func writeOutput(path string, data []byte) error {
+	if info, err := os.Stat(path); err == nil && !info.Mode().IsRegular() {
+		return os.WriteFile(path, data, 0o644)
+	}
+
+	return writeFileAtomic(path, data)
 }
 
 // writeFileAtomic replaces path with data so a reader sees either the old file
