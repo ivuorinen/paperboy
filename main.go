@@ -193,7 +193,7 @@ func run(configFile string) error {
 // digest. The temp file is created beside path because rename is atomic only
 // within one filesystem, and it is removed on any failure.
 //
-// A first run has no old file to protect. The open below creates an empty
+// A first run has no old file to protect. openLikeWriteFile creates an empty
 // one, which a reader can see until the rename and which stays if a later
 // step fails, much as os.WriteFile's partial write did. Avoiding it would
 // mean resolving a dangling link chain by hand and making the temp file
@@ -203,31 +203,15 @@ func run(configFile string) error {
 // The replacement takes the current file's mode, which os.WriteFile kept by
 // never recreating the file. CreateTemp makes 0600, and forcing any fixed mode
 // instead would widen a private digest or override the umask. A first run
-// gets os.WriteFile's 0644 narrowed by the umask, from the O_CREATE open below.
+// gets os.WriteFile's 0644 narrowed by the umask, from openLikeWriteFile.
 //
 // A symlinked path is resolved first, so the link's target is replaced as
 // os.WriteFile would have written through it; renaming onto the link path
-// would swap the link itself for a regular file.
-//
-// A missing path or an existing regular file is first opened for writing,
-// with O_CREATE and no O_TRUNC, the open os.WriteFile made. The kernel then
-// resolves a link as before and creates a missing target, including the
-// not-yet-written target of a link set up before the first run; without it,
-// EvalSymlinks fails on a dangling link and the rename replaces the link. The
-// same open makes a read-only output fail as it did under os.WriteFile,
-// where a rename alone needs only the directory's write permission. A
-// directory skips the open and fails at the rename. Writing therefore needs
-// write access to the file, as os.WriteFile did, and to its directory.
+// would swap the link itself for a regular file. Writing needs write access
+// to the file, as os.WriteFile did, and to its directory.
 func writeFileAtomic(path string, data []byte) (err error) {
-	if info, statErr := os.Stat(path); errors.Is(statErr, os.ErrNotExist) || (statErr == nil && info.Mode().IsRegular()) {
-		var f *os.File
-		if f, err = os.OpenFile(path, os.O_WRONLY|os.O_CREATE, 0o644); err != nil {
-			return err
-		}
-
-		if err = f.Close(); err != nil {
-			return err
-		}
+	if err = openLikeWriteFile(path); err != nil {
+		return err
 	}
 
 	if path, err = filepath.EvalSymlinks(path); err != nil {
@@ -264,6 +248,30 @@ func writeFileAtomic(path string, data []byte) (err error) {
 	}
 
 	return os.Rename(tmp.Name(), path)
+}
+
+// openLikeWriteFile makes the open os.WriteFile made, O_WRONLY|O_CREATE
+// without O_TRUNC, and closes the file again without writing. The kernel
+// resolves a link as before and creates a missing target, including the
+// not-yet-written target of a link set up before the first run; without it,
+// EvalSymlinks fails on a dangling link and the rename replaces the link. The
+// same open makes a read-only output fail as it did under os.WriteFile, where
+// a rename alone needs only the directory's write permission.
+//
+// An existing path that is not a regular file skips the open, so a directory
+// fails at the rename. Any other Stat failure falls through to the open,
+// which fails the same way and returns that error.
+func openLikeWriteFile(path string) error {
+	if info, err := os.Stat(path); err == nil && !info.Mode().IsRegular() {
+		return nil
+	}
+
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE, 0o644)
+	if err != nil {
+		return err
+	}
+
+	return f.Close()
 }
 
 // loadConfig reads and validates the YAML configuration.
