@@ -18,13 +18,14 @@ import (
 	"maps"
 	"net/url"
 	"os"
+	"path/filepath"
 	"regexp"
 	"slices"
 	"strings"
 	"time"
 
 	"github.com/mmcdole/gofeed"
-	"gopkg.in/yaml.v3"
+	"go.yaml.in/yaml/v3"
 )
 
 // version and build are stamped by the linker; see the build target in the
@@ -45,7 +46,17 @@ const maxFeedBytes = 16 << 20
 // domainRe matches the trailing dotted-label sequence of a host. Compiled once
 // at package scope: MustCompile panics on a bad pattern, which belongs at
 // startup rather than part-way through a run.
-var domainRe = regexp.MustCompile(`([a-z0-9\-]+\.)+[a-z0-9\-]+`)
+//
+// Labels are Unicode letters, digits, "_" and "-": url.Parse keeps IDN hosts in
+// Unicode, and an ASCII-only class matched from after the last non-ASCII rune,
+// turning "bücher.example" into the plausible but wrong "cher.example".
+var domainRe = regexp.MustCompile(`([\p{L}\p{N}_-]+\.)+[\p{L}\p{N}_-]+`)
+
+// templateSep matches a template separator: a line holding only "---", with
+// optional trailing blanks and a CRLF ending. Splitting on the bare substring
+// also cut at "---" mid-line and inside longer horizontal rules such as
+// "----", silently dropping the header text in between.
+var templateSep = regexp.MustCompile(`(?m)^---[ \t]*\r?$`)
 
 // mdTextEscaper escapes the brackets that would close a Markdown link label
 // early, letting remote text break out of the label it is placed in.
@@ -59,7 +70,14 @@ var domainRe = regexp.MustCompile(`([a-z0-9\-]+\.)+[a-z0-9\-]+`)
 // evil.example rather than at the article. strings.NewReplacer does not
 // rescan its own output, so escaping the escape character in the same
 // Replacer is correct and does not double-apply.
-var mdTextEscaper = strings.NewReplacer(`\`, `\\`, "[", `\[`, "]", `\]`)
+//
+// "<" is escaped because CommonMark raw HTML and autolinks both open with it
+// and bind tighter than link brackets, so bracket escaping alone does not stop
+// them. Unescaped, a feed title `<https://evil.example/phish>` rendered as a
+// live link even under goldmark's safe defaults, and `<img onerror=...>` or
+// `<h1>` passed through any renderer that allows raw HTML. A backslash-escaped
+// "<" is literal text, which disables both constructs.
+var mdTextEscaper = strings.NewReplacer(`\`, `\\`, "[", `\[`, "]", `\]`, "<", `\<`)
 
 // mdURLEscaper percent-encodes the characters that would terminate a Markdown
 // link target early. net/url leaves parentheses unescaped in paths, since they
@@ -89,16 +107,25 @@ func main() {
 	configFile := flag.String("config", "config.yaml", "path to the YAML configuration file")
 	flag.Parse()
 
-	config, err := loadConfig(*configFile)
+	if err := run(*configFile); err != nil {
+		log.Fatalf("Error %v", err)
+	}
+}
+
+// run performs one fetch-and-write cycle for the configuration at configFile.
+// It is main without the process exit, so the whole pipeline — config,
+// template, fetching, week grouping and the output write — runs under test.
+func run(configFile string) error {
+	config, err := loadConfig(configFile)
 	if err != nil {
-		log.Fatalf("Error loading config: %v", err)
+		return fmt.Errorf("loading config: %w", err)
 	}
 
 	// Read the template before any network work: a malformed template then
 	// costs a second rather than a full fetch cycle over every feed.
 	header, footer, err := loadTemplate(config.Template)
 	if err != nil {
-		log.Fatalf("Error loading template: %v", err)
+		return fmt.Errorf("loading template: %w", err)
 	}
 
 	log.Printf("Feeds: %d", len(config.Feeds))
@@ -108,6 +135,7 @@ func main() {
 	fp.UserAgent = fmt.Sprintf("paperboy/%s (+https://github.com/ivuorinen/paperboy)", version)
 
 	articlesByWeek := make(map[string][]Article)
+	fetched := 0
 
 	for _, feedURL := range config.Feeds {
 		log.Printf("Fetching articles from %s", feedURL)
@@ -118,6 +146,7 @@ func main() {
 			continue
 		}
 
+		fetched++
 		log.Printf("-> Got %d articles", len(articles))
 
 		// Group articles by publish week
@@ -128,6 +157,13 @@ func main() {
 			id := fmt.Sprintf("%d-%02d", year, week)
 			articlesByWeek[id] = append(articlesByWeek[id], article)
 		}
+	}
+
+	// A single failing feed is logged and skipped, but losing every feed is an
+	// outage (network, DNS, proxy), not news: writing would replace the last
+	// good digest with an empty one and report success to cron.
+	if fetched == 0 {
+		return fmt.Errorf("fetching feeds: all %d failed; %s left untouched", len(config.Feeds), config.Output)
 	}
 
 	// Newest week first. Derived from the map rather than tracked alongside it,
@@ -141,12 +177,123 @@ func main() {
 
 	log.Printf("-> Generated Markdown output")
 
-	if err := os.WriteFile(config.Output, []byte(output), 0644); err != nil {
-		log.Fatalf("Error writing output file: %v", err)
+	if err := writeOutput(config.Output, []byte(output)); err != nil {
+		return fmt.Errorf("writing output file: %w", err)
 	}
 
 	log.Printf("-> Wrote output to %s", config.Output)
 	log.Printf("Paperboy finished")
+
+	return nil
+}
+
+// writeOutput writes the digest to path. An existing path that is not a
+// regular file, such as a FIFO or a device, is written in place with
+// os.WriteFile, as before writeFileAtomic existed: a rename would remove the
+// node, so a reader on the pipe, or an output such as /dev/stdout, would get
+// nothing while the run reported success. A directory fails there, as it did
+// then. A regular file or a missing path goes to writeFileAtomic.
+func writeOutput(path string, data []byte) error {
+	if info, err := os.Stat(path); err == nil && !info.Mode().IsRegular() {
+		return os.WriteFile(path, data, 0o644)
+	}
+
+	return writeFileAtomic(path, data)
+}
+
+// writeFileAtomic replaces path with data so a reader sees either the old file
+// or the new one, never a truncated mix. os.WriteFile truncates in place, so a
+// failure after the truncate (ENOSPC, a kill mid-write) destroyed the previous
+// digest. The temp file is created beside path because rename is atomic only
+// within one filesystem, and it is removed on any failure.
+//
+// A first run has no old file to protect. openLikeWriteFile creates an empty
+// one, which a reader can see until the rename and which stays if a later
+// step fails, much as os.WriteFile's partial write did. Avoiding it would
+// mean resolving a dangling link chain by hand and making the temp file
+// without CreateTemp to keep the umask, for a window that only exists before
+// the first digest.
+//
+// The replacement takes the current file's mode, owner and group, which
+// os.WriteFile kept by never recreating the file. CreateTemp makes 0600, and
+// forcing any fixed mode instead would widen a private digest or override the
+// umask. A first run gets os.WriteFile's 0644 narrowed by the umask, from
+// openLikeWriteFile. An output owned by another user, or by a group the
+// process is not in, therefore needs root to write, where os.WriteFile needed
+// only write access to the file; see keepOwner. ACLs, extended attributes and
+// further hard links are not carried over.
+//
+// A symlinked path is resolved first, so the link's target is replaced as
+// os.WriteFile would have written through it; renaming onto the link path
+// would swap the link itself for a regular file. Writing needs write access
+// to the file, as os.WriteFile did, and to its directory.
+func writeFileAtomic(path string, data []byte) (err error) {
+	if err = openLikeWriteFile(path); err != nil {
+		return err
+	}
+
+	if path, err = filepath.EvalSymlinks(path); err != nil {
+		return err
+	}
+
+	current, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".paperboy-*")
+	if err != nil {
+		return err
+	}
+
+	defer func() {
+		if err != nil {
+			_ = os.Remove(tmp.Name())
+		}
+	}()
+
+	if _, err = tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+
+	if err = tmp.Close(); err != nil {
+		return err
+	}
+
+	if err = keepOwner(tmp.Name(), current); err != nil {
+		return err
+	}
+
+	if err = os.Chmod(tmp.Name(), current.Mode().Perm()); err != nil {
+		return err
+	}
+
+	return os.Rename(tmp.Name(), path)
+}
+
+// openLikeWriteFile makes the open os.WriteFile made, O_WRONLY|O_CREATE
+// without O_TRUNC, and closes the file again without writing. The kernel
+// resolves a link as before and creates a missing target, including the
+// not-yet-written target of a link set up before the first run; without it,
+// EvalSymlinks fails on a dangling link and the rename replaces the link. The
+// same open makes a read-only output fail as it did under os.WriteFile, where
+// a rename alone needs only the directory's write permission.
+//
+// An existing path that is not a regular file skips the open, so a directory
+// fails at the rename. Any other Stat failure falls through to the open,
+// which fails the same way and returns that error.
+func openLikeWriteFile(path string) error {
+	if info, err := os.Stat(path); err == nil && !info.Mode().IsRegular() {
+		return nil
+	}
+
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE, 0o644)
+	if err != nil {
+		return err
+	}
+
+	return f.Close()
 }
 
 // loadConfig reads and validates the YAML configuration.
@@ -193,7 +340,7 @@ func loadTemplate(path string) (header, footer string, err error) {
 		return "", "", fmt.Errorf("reading template %s: %w", path, err)
 	}
 
-	parts := strings.SplitN(string(data), "---", 3)
+	parts := templateSep.Split(string(data), 3)
 	if len(parts) != 3 {
 		return "", "", fmt.Errorf(
 			"template %s: want a header and footer separated by two --- lines, found %d section(s)",
@@ -273,17 +420,28 @@ func generateMarkdown(header, footer string, articlesByWeek map[string][]Article
 		fmt.Fprintf(&output, "## Week: %s\n\n", week)
 
 		for _, article := range articles {
-			date := article.PublishAt.Format("2006-01-02")
+			// The "@ domain" part is omitted for an item with no link to take
+			// a domain from; otherwise the line read "@ :".
+			prefix := article.PublishAt.Format("2006-01-02")
+			if article.URLDomain != "" {
+				prefix += " @ " + article.URLDomain
+			}
+
+			// RSS 2.0 allows items without a title, and an empty label renders
+			// as an anchor with no visible text.
 			title := mdText(article.Title)
+			if title == "" {
+				title = "(untitled)"
+			}
 
 			// A link that is not a plain absolute http(s) URL is dropped
 			// rather than rendered, leaving the entry as plain text.
 			if link := mdURL(article.URL); link != "" {
-				fmt.Fprintf(&output, "- %s @ %s: [%s](%s)\n", date, article.URLDomain, title, link)
+				fmt.Fprintf(&output, "- %s: [%s](%s)\n", prefix, title, link)
 				continue
 			}
 
-			fmt.Fprintf(&output, "- %s @ %s: %s\n", date, article.URLDomain, title)
+			fmt.Fprintf(&output, "- %s: %s\n", prefix, title)
 		}
 
 		output.WriteString("\n")

@@ -7,16 +7,24 @@ on:
   pull_request:
     branches: ["main"]
 
+# Nothing at workflow level: a job without its own permissions block gets no
+# token scope at all, so each job below opts into exactly what it needs.
+permissions: {}
+
 jobs:
   test-build-and-run:
     runs-on: ubuntu-latest
-    # Declared per job rather than once at workflow level: a job-level block is
-    # explicit about what that job may do, and a new job cannot silently
-    # inherit a scope nobody chose for it.
     permissions:
       contents: read
+    env:
+      # renovate: datasource=github-releases depName=golangci/golangci-lint
+      GOLANGCI_LINT_VERSION: v2.15.0
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # No later step runs git, so the token is not left in .git/config
+          # where the build and the feed-fetching smoke run could read it.
+          persist-credentials: false
 
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
@@ -27,6 +35,21 @@ jobs:
       - name: Vet
         run: go vet ./...
 
+      - name: Check formatting
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt -l lists unformatted files:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      # The same linter `make lint` runs, so CI and a local run cannot disagree.
+      - name: Lint
+        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          version: ${{ env.GOLANGCI_LINT_VERSION }}
+
       - name: Test
         run: go test ./...
 
@@ -36,10 +59,12 @@ jobs:
       - name: Setup default template and config
         run: cp examples/* .
 
-      # Smoke test only: this fetches live third-party feeds, so it is not a
-      # correctness signal. Feed errors are logged and skipped by design, which
-      # means this step can pass while every feed is unreachable. The go test
-      # step above is what actually gates the build.
+      # Live run against the example feeds. A failing feed is logged and
+      # skipped, so one third-party outage does not fail this step. It fails
+      # when paperboy cannot load the example config and template, which no
+      # test reads, or cannot fetch any of the six feeds: six independent hosts
+      # down at once means paperboy itself cannot fetch, which the offline
+      # tests cannot see.
       - name: Run program
         run: ./paperboy
 

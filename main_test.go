@@ -6,6 +6,10 @@
 package main
 
 import (
+	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -130,6 +134,12 @@ func TestGetURLDomain(t *testing.T) {
 		{"malformed percent escape", "https://example.com/%zz", "example.com"},
 		// Regression: the old `^https?` regexp matched this and produced "".
 		{"http-prefixed non-URL", "httpfoo.example.com", "httpfoo.example.com"},
+		// url.Parse keeps IDN hosts in Unicode; an ASCII-only pattern
+		// matched from after the last non-ASCII rune, yielding the plausible
+		// but wrong "cher.example" and "ller.example".
+		{"IDN host", "https://bücher.example/post", "bücher.example"},
+		{"IDN host with www", "https://www.müller.example/a", "müller.example"},
+		{"underscore label", "https://my_blog.example.com/a", "my_blog.example.com"},
 		{"empty", "", ""},
 		{"no domain present", "not a url", ""},
 	})
@@ -147,6 +157,11 @@ func TestMdText(t *testing.T) {
 		// supply its own destination.
 		{"backslash escaped", `Title\`, `Title\\`},
 		{"retarget payload", `x\](https://evil.example)`, `x\\\](https://evil.example)`},
+		// Raw HTML and autolinks both open with "<" and bind tighter than
+		// link brackets, so an unescaped "<" smuggles markup or a live link
+		// past the bracket escaping above.
+		{"raw html escaped", `<img src=x onerror=alert(1)>`, `\<img src=x onerror=alert(1)>`},
+		{"autolink escaped", `<https://evil.example/phish>`, `\<https://evil.example/phish>`},
 		{"empty", "", ""},
 	})
 }
@@ -277,6 +292,46 @@ func TestLoadTemplateValid(t *testing.T) {
 	}
 }
 
+// TestLoadTemplateSplitsOnSeparatorLinesOnly is the regression test for the
+// substring split: a "---" anywhere, mid-line or inside a longer horizontal
+// rule, used to count as a separator and silently drop header text.
+func TestLoadTemplateSplitsOnSeparatorLinesOnly(t *testing.T) {
+	cases := []struct {
+		name, template, header, footer string
+	}{
+		{
+			"mid-line dashes",
+			"# Weekly\n\nIntro --- read on\n\n---\n\n---\n\nFooter\n",
+			"# Weekly\n\nIntro --- read on", "Footer",
+		},
+		{
+			"longer horizontal rule",
+			"# Weekly\n\n----\n\nIntro paragraph\n\n---\n\n---\n\nFooter\n",
+			"# Weekly\n\n----\n\nIntro paragraph", "Footer",
+		},
+		{
+			"CRLF line endings",
+			"# Weekly\r\n\r\n---\r\n\r\n---\r\n\r\nFooter\r\n",
+			"# Weekly", "Footer",
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			header, footer, err := loadTemplate(writeTemp(t, "template.md", c.template))
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if header != c.header {
+				t.Errorf("header = %q, want %q", header, c.header)
+			}
+			if footer != c.footer {
+				t.Errorf("footer = %q, want %q", footer, c.footer)
+			}
+		})
+	}
+}
+
 func TestLoadTemplateRejectsBadInput(t *testing.T) {
 	t.Run("too few separators", func(t *testing.T) {
 		path := writeTemp(t, "template.md", "# Header\n\n---\n\nFooter\n")
@@ -306,11 +361,26 @@ func TestLoadConfigValid(t *testing.T) {
 	}
 }
 
+// TestLoadConfigRejectsUnknownKey is the regression test for silently ignored
+// keys: a misspelled key used to unmarshal cleanly and fail only after every
+// feed had been fetched. The fixture is otherwise complete, so only the
+// unknown-key check can reject it; a fixture missing a required field passes
+// even with that check deleted.
+func TestLoadConfigRejectsUnknownKey(t *testing.T) {
+	path := writeTemp(t, "config.yaml",
+		"feeds:\n  - https://e.com/f\ntemplate: template.md\noutput: output.md\nextra: x\n")
+
+	_, err := loadConfig(path)
+	if err == nil {
+		t.Fatal("want an error for the unknown key, got nil")
+	}
+	if !strings.Contains(err.Error(), "extra") {
+		t.Errorf("error %q does not name the unknown key \"extra\"", err)
+	}
+}
+
 func TestLoadConfigRejectsBadInput(t *testing.T) {
 	cases := map[string]string{
-		// Regression: a misspelled key previously unmarshalled cleanly and
-		// failed only after every feed had been fetched.
-		"unknown key": "feeds:\n  - https://e.com/f\ntemplate: template.md\noutout: output.md\n",
 		"no feeds":    "template: template.md\noutput: output.md\n",
 		"no template": "feeds:\n  - https://e.com/f\noutput: output.md\n",
 		"no output":   "feeds:\n  - https://e.com/f\ntemplate: template.md\n",
@@ -395,6 +465,390 @@ func TestGenerateMarkdownRejectsUnsafeLink(t *testing.T) {
 	}
 	if !strings.Contains(got, "Sketchy") {
 		t.Errorf("title dropped along with the link\n---\n%s", got)
+	}
+}
+
+// TestGenerateMarkdownOptionalFields covers items without a title or a link,
+// both valid in RSS 2.0. An empty title used to render "[](url)", an anchor
+// with no visible text, and an empty domain rendered as "@ :".
+func TestGenerateMarkdownOptionalFields(t *testing.T) {
+	cases := []struct {
+		name    string
+		article Article
+		want    string
+	}{
+		{
+			"untitled",
+			Article{URL: "https://a.example/1", URLDomain: "a.example"},
+			"- 2026-01-01 @ a.example: [(untitled)](https://a.example/1)",
+		},
+		{
+			"whitespace-only title",
+			Article{Title: " \n\t", URL: "https://a.example/1", URLDomain: "a.example"},
+			"- 2026-01-01 @ a.example: [(untitled)](https://a.example/1)",
+		},
+		{
+			"no link",
+			Article{Title: "No link item"},
+			"- 2026-01-01: No link item",
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			c.article.PublishAt = mustTime(t, "2026-01-01T00:00:00Z")
+			got := generateMarkdown("HEAD", "FOOT", map[string][]Article{"2026-01": {c.article}}, []string{"2026-01"})
+
+			items := linesWithPrefix(got, "- ")
+			if len(items) != 1 {
+				t.Fatalf("got %d list-item lines, want 1\n---\n%s", len(items), got)
+			}
+			if items[0] != c.want {
+				t.Errorf("item = %q, want %q", items[0], c.want)
+			}
+		})
+	}
+}
+
+// TestGenerateMarkdownTitleCannotRelink covers the plain-text branch: an item
+// whose link is rejected must stay unlinked, so its title must not be able to
+// reintroduce a link as a CommonMark autolink.
+func TestGenerateMarkdownTitleCannotRelink(t *testing.T) {
+	byWeek := map[string][]Article{
+		"2026-01": {{
+			Title:     "<https://evil.example/phish>",
+			URL:       "javascript:alert(1)",
+			URLDomain: "a.example",
+			PublishAt: mustTime(t, "2026-01-01T00:00:00Z"),
+		}},
+	}
+
+	got := generateMarkdown("HEAD", "FOOT", byWeek, []string{"2026-01"})
+
+	items := linesWithPrefix(got, "- ")
+	if len(items) != 1 {
+		t.Fatalf("got %d list-item lines, want 1\n---\n%s", len(items), got)
+	}
+	if want := "- 2026-01-01 @ a.example: \\<https://evil.example/phish>"; items[0] != want {
+		t.Errorf("item = %q, want %q", items[0], want)
+	}
+}
+
+// writeRunConfig writes a valid template and a config naming feeds, the
+// template and output, returning the config path. Paths are absolute, so run
+// does not depend on the test's working directory.
+func writeRunConfig(t *testing.T, output string, feeds ...string) string {
+	t.Helper()
+
+	template := writeTemp(t, "template.md", "# Head\n\n---\n\n---\n\nFoot\n")
+
+	var b strings.Builder
+	b.WriteString("feeds:\n")
+	for _, feed := range feeds {
+		fmt.Fprintf(&b, "  - %q\n", feed)
+	}
+	fmt.Fprintf(&b, "template: %q\noutput: %q\n", template, output)
+
+	return writeTemp(t, "config.yaml", b.String())
+}
+
+// TestRunAllFeedsFailedKeepsOutput is the regression test for the fail-open
+// run: with every feed down it used to overwrite the last digest with an empty
+// one and exit 0, so a cron job mailed an empty newsletter.
+func TestRunAllFeedsFailedKeepsOutput(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "down", http.StatusInternalServerError)
+	}))
+	t.Cleanup(srv.Close)
+
+	output := writeTemp(t, "output.md", "previous digest\n")
+
+	if err := run(writeRunConfig(t, output, srv.URL+"/a", srv.URL+"/b")); err == nil {
+		t.Fatal("run returned nil with every feed failing, want an error")
+	}
+
+	got, err := os.ReadFile(output)
+	if err != nil {
+		t.Fatalf("reading output: %v", err)
+	}
+	if string(got) != "previous digest\n" {
+		t.Errorf("output = %q, want the previous digest left untouched", got)
+	}
+}
+
+// rssFeed wraps items in a minimal RSS 2.0 document.
+func rssFeed(items ...string) string {
+	return `<?xml version="1.0"?><rss version="2.0"><channel><title>t</title>` +
+		`<link>https://example.com</link><description>d</description>` +
+		strings.Join(items, "") + `</channel></rss>`
+}
+
+// rssItem renders one dated item linking to https://example.com/<slug>.
+func rssItem(title, slug, pubDate string) string {
+	return fmt.Sprintf("<item><title>%s</title><link>https://example.com/%s</link><pubDate>%s</pubDate></item>",
+		title, slug, pubDate)
+}
+
+// feedServer serves each path in feeds as an RSS body and answers every other
+// path with HTTP 500, standing in for an unreachable feed.
+func feedServer(t *testing.T, feeds map[string]string) *httptest.Server {
+	t.Helper()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, ok := feeds[r.URL.Path]
+		if !ok {
+			http.Error(w, "down", http.StatusInternalServerError)
+			return
+		}
+		_, _ = w.Write([]byte(body))
+	}))
+	t.Cleanup(srv.Close)
+
+	return srv
+}
+
+// runToString runs one cycle over feeds and returns the written output.
+func runToString(t *testing.T, feeds ...string) string {
+	t.Helper()
+
+	output := writeTemp(t, "output.md", "previous digest\n")
+	if err := run(writeRunConfig(t, output, feeds...)); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	got, err := os.ReadFile(output)
+	if err != nil {
+		t.Fatalf("reading output: %v", err)
+	}
+
+	return string(got)
+}
+
+// TestRunGroupsByISOWeek drives the whole pipeline with one healthy and one
+// failing feed. Weeks are ISO weeks: 2024-12-30 belongs to 2025-01 and
+// 2027-01-01 to 2026-53 (checked with `date +%G-%V`), which a calendar-year
+// grouping would get wrong at both ends of the year.
+func TestRunGroupsByISOWeek(t *testing.T) {
+	srv := feedServer(t, map[string]string{
+		"/ok": rssFeed(
+			rssItem("Boundary", "1", "Mon, 30 Dec 2024 12:00:00 GMT"),
+			rssItem("Year end", "2", "Fri, 01 Jan 2027 12:00:00 GMT"),
+		),
+	})
+
+	got := runToString(t, srv.URL+"/ok", srv.URL+"/down")
+
+	assertOrder(t, got, "# Head", "## Week: 2026-53", "Year end", "## Week: 2025-01", "Boundary", "Foot")
+	if strings.Contains(got, "previous digest") {
+		t.Errorf("a partial failure must still replace the old digest\n---\n%s", got)
+	}
+}
+
+// TestRunSendsUserAgent checks the identifying User-Agent reaches the feed
+// server; gofeed's default is "Gofeed/1.0", which some hosts block.
+func TestRunSendsUserAgent(t *testing.T) {
+	var agent string
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		agent = r.Header.Get("User-Agent")
+		_, _ = w.Write([]byte(rssFeed(rssItem("Post", "1", "Tue, 06 Jan 2026 12:00:00 GMT"))))
+	}))
+	t.Cleanup(srv.Close)
+
+	runToString(t, srv.URL)
+
+	if !strings.HasPrefix(agent, "paperboy/") {
+		t.Errorf("User-Agent = %q, want it to start with %q", agent, "paperboy/")
+	}
+}
+
+// TestRunCapsFeedSize serves a valid feed one byte over maxFeedBytes next to a
+// small one. Without the cap gofeed reads the whole body and the oversized
+// feed's article reaches the digest.
+func TestRunCapsFeedSize(t *testing.T) {
+	huge := rssFeed(
+		"<item><title>Huge</title><link>https://example.com/h</link><pubDate>Tue, 06 Jan 2026 12:00:00 GMT</pubDate>" +
+			"<description>" + strings.Repeat("a", maxFeedBytes+1) + "</description></item>",
+	)
+	srv := feedServer(t, map[string]string{
+		"/huge":  huge,
+		"/small": rssFeed(rssItem("Small", "s", "Tue, 06 Jan 2026 12:00:00 GMT")),
+	})
+
+	got := runToString(t, srv.URL+"/huge", srv.URL+"/small")
+
+	if !strings.Contains(got, "Small") {
+		t.Errorf("the small feed's article is missing\n---\n%s", got)
+	}
+	if strings.Contains(got, "Huge") {
+		t.Error("the oversized feed was read past maxFeedBytes and rendered")
+	}
+}
+
+// TestWriteFileAtomicReplacesWholeFile pins the rename-over semantics. A reader
+// holding the old file keeps the old bytes only if the path was swapped to a
+// new file; os.WriteFile truncates the same inode in place, which is what let a
+// failed write destroy the previous digest.
+//
+// The replacement also keeps the old file's mode, as os.WriteFile did by never
+// recreating it. 0640 differs from both CreateTemp's 0600 and a forced 0644,
+// so neither leaving the temp file's mode nor overriding it passes.
+func TestWriteFileAtomicReplacesWholeFile(t *testing.T) {
+	path := writeTemp(t, "output.md", "previous digest\n")
+	if err := os.Chmod(path, 0o640); err != nil {
+		t.Fatalf("setting output mode: %v", err)
+	}
+
+	old, err := os.Open(path)
+	if err != nil {
+		t.Fatalf("opening old output: %v", err)
+	}
+	t.Cleanup(func() { _ = old.Close() })
+
+	if err := writeFileAtomic(path, []byte("new digest\n")); err != nil {
+		t.Fatalf("writeFileAtomic: %v", err)
+	}
+
+	stale := make([]byte, 64)
+	n, _ := old.Read(stale)
+	if got := string(stale[:n]); got != "previous digest\n" {
+		t.Errorf("reader of the old file saw %q, want the old bytes intact", got)
+	}
+
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading new output: %v", err)
+	}
+	if string(got) != "new digest\n" {
+		t.Errorf("output = %q, want %q", got, "new digest\n")
+	}
+
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat output: %v", err)
+	}
+	if mode := info.Mode().Perm(); mode != 0o640 {
+		t.Errorf("output mode = %o, want the existing file's 640 kept", mode)
+	}
+
+	assertNoTempFiles(t, filepath.Dir(path))
+}
+
+// TestWriteFileAtomicCleansUpOnFailure renames onto a directory, which fails
+// after the temp file exists; the temp file must not be left behind. The
+// error must come from the rename (*os.LinkError): a failure any earlier, such
+// as an open of the directory, would pass the leftover check without the
+// cleanup ever running.
+func TestWriteFileAtomicCleansUpOnFailure(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "output.md")
+	if err := os.Mkdir(target, 0o755); err != nil {
+		t.Fatalf("creating blocking directory: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(target, "keep"), nil, 0o600); err != nil {
+		t.Fatalf("populating blocking directory: %v", err)
+	}
+
+	err := writeFileAtomic(target, []byte("x"))
+	var linkErr *os.LinkError
+	if !errors.As(err, &linkErr) {
+		t.Fatalf("writeFileAtomic onto a non-empty directory = %v, want the rename's *os.LinkError", err)
+	}
+
+	assertNoTempFiles(t, dir)
+}
+
+// TestWriteFileAtomicKeepsReadOnlyOutput covers an output its operator made
+// read-only. os.WriteFile failed to open it for writing, while a rename needs
+// only the directory's write permission, so without a check on the file
+// itself the protected digest was silently replaced. Root bypasses permission
+// bits, so the test cannot observe the check when run as root.
+func TestWriteFileAtomicKeepsReadOnlyOutput(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root bypasses file permission bits")
+	}
+
+	path := writeTemp(t, "output.md", "previous digest\n")
+	if err := os.Chmod(path, 0o444); err != nil {
+		t.Fatalf("making output read-only: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(path, 0o600) })
+
+	if err := writeFileAtomic(path, []byte("new digest\n")); err == nil {
+		t.Fatal("writeFileAtomic replaced a read-only output, want an error")
+	}
+
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading output: %v", err)
+	}
+	if string(got) != "previous digest\n" {
+		t.Errorf("output = %q, want the read-only digest left untouched", got)
+	}
+
+	assertNoTempFiles(t, filepath.Dir(path))
+}
+
+// TestWriteFileAtomicFollowsSymlink keeps a symlinked output working: os.WriteFile
+// wrote through the link, and a bare rename onto the link path would replace
+// the link itself with a regular file, so the real target stops updating.
+//
+// The dangling case is a link set up before the first run, pointing at a
+// digest that does not exist yet: os.WriteFile created the target through it.
+func TestWriteFileAtomicFollowsSymlink(t *testing.T) {
+	cases := []struct {
+		name   string
+		target func(t *testing.T) string
+	}{
+		{"existing target", func(t *testing.T) string {
+			return writeTemp(t, "served.md", "previous digest\n")
+		}},
+		{"dangling link", func(t *testing.T) string {
+			return filepath.Join(t.TempDir(), "served.md")
+		}},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			target := c.target(t)
+			link := filepath.Join(t.TempDir(), "output.md")
+			if err := os.Symlink(target, link); err != nil {
+				t.Fatalf("creating symlink: %v", err)
+			}
+
+			if err := writeFileAtomic(link, []byte("new digest\n")); err != nil {
+				t.Fatalf("writeFileAtomic: %v", err)
+			}
+
+			info, err := os.Lstat(link)
+			if err != nil {
+				t.Fatalf("lstat link: %v", err)
+			}
+			if info.Mode()&os.ModeSymlink == 0 {
+				t.Errorf("output path is now a %v, want it to stay a symlink", info.Mode().Type())
+			}
+
+			got, err := os.ReadFile(target)
+			if err != nil {
+				t.Fatalf("reading target: %v", err)
+			}
+			if string(got) != "new digest\n" {
+				t.Errorf("symlink target = %q, want %q", got, "new digest\n")
+			}
+		})
+	}
+}
+
+// assertNoTempFiles fails if writeFileAtomic left a temp file in dir.
+func assertNoTempFiles(t *testing.T, dir string) {
+	t.Helper()
+
+	leftovers, err := filepath.Glob(filepath.Join(dir, ".paperboy-*"))
+	if err != nil {
+		t.Fatalf("globbing temp files: %v", err)
+	}
+	if len(leftovers) != 0 {
+		t.Errorf("temp files left behind: %v", leftovers)
 	}
 }
 
